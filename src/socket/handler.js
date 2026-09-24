@@ -12,6 +12,13 @@ function initSocket(io) {
       const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
       const user = await User.findById(payload.sub);
       if (!user || user.status !== 'Active') return next(new Error('Inactive account'));
+      // Single-device: a socket minted for a device that no longer owns the
+      // login lock (or whose session was logged out) may not connect — the
+      // same rule as every REST call, applied at the socket boundary.
+      if (payload.deviceId && !user.currentDeviceId) return next(new Error('Session ended'));
+      if (payload.deviceId && user.currentDeviceId && payload.deviceId !== user.currentDeviceId) {
+        return next(new Error('Signed in on another device'));
+      }
       socket.user = user;
       next();
     } catch (e) {

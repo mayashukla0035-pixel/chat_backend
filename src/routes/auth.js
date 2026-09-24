@@ -2,7 +2,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const OtpSession = require('../models/OtpSession');
-const { signToken } = require('../middleware/auth');
+const { signToken, DEVICE_BLOCK_MSG } = require('../middleware/auth');
 const { sendOtpEmail } = require('../services/mailer');
 const { runSync, checkUserInSheet } = require('../services/sheetsSync');
 const { ensureSupportAccount, isSupportCredentials, isSupportAccount } = require('../services/support');
@@ -18,10 +18,9 @@ function makeCode() {
 // session is not stale — JWTs live 30 days, mirroring signToken), a login
 // attempt from ANY other device is rejected with 403 instead of silently
 // taking over. Logging out (POST /api/auth/logout) clears the lock, which is
-// how a user moves to a new device.
+// how a user moves to a new device. The rejection message itself lives in
+// middleware/auth.js and is shared with the per-request device check.
 const SESSION_ACTIVE_MS = 30 * 24 * 60 * 60 * 1000;
-const DEVICE_BLOCK_MSG =
-  'This account is already signed in on another device. Log out there first, then sign in here.';
 function blockedByOtherDevice(user, deviceId) {
   if (!deviceId || !user.currentDeviceId || user.currentDeviceId === deviceId) return false;
   const last = user.lastLoginAt ? new Date(user.lastLoginAt).getTime() : 0;
@@ -71,7 +70,12 @@ router.post('/request-otp', async (req, res) => {
 
     // Support login: matching email + Teacher ID from .env -> direct token, no OTP.
     if (isSupportCredentials(email, teacherId)) {
-      const token = signToken(user);
+      // Same contract as verify-otp/support-login: record the device lock so
+      // the direct-token session is single-device too.
+      const upd = { lastLoginAt: new Date() };
+      if (reqDeviceId) upd.currentDeviceId = reqDeviceId;
+      await User.findByIdAndUpdate(user._id, upd);
+      const token = signToken(user, reqDeviceId);
       return res.json({ ok: true, directToken: token, user });
     }
 
@@ -125,7 +129,7 @@ router.post('/verify-otp', async (req, res) => {
     const update = { lastLoginAt: new Date() };
     if (deviceId) update.currentDeviceId = deviceId;
     await User.findByIdAndUpdate(user._id, update);
-    const token = signToken(user);
+    const token = signToken(user, deviceId);
     const updatedUser = await User.findById(user._id).lean();
     return res.json({ ok: true, token, user: updatedUser });
   } catch (e) {
@@ -161,7 +165,7 @@ router.post('/support-login', async (req, res) => {
     if (deviceId) update.currentDeviceId = deviceId;
     await User.findByIdAndUpdate(user._id, update);
     
-    const token = signToken(user);
+    const token = signToken(user, deviceId);
     const updatedUser = await User.findById(user._id).lean();
     return res.json({ ok: true, token, user: updatedUser, directToken: token });
   } catch (e) {
@@ -217,13 +221,20 @@ router.post('/refresh', async (req, res) => {
       return res.status(401).json({ error: 'This account is no longer active.' });
     }
     const deviceId = String(req.body.deviceId || '').trim();
+    // A session whose lock was released (logout) can never be renewed, even
+    // with an authentic token — that's what makes logged-out tokens dead.
+    if (payload.deviceId && !user.currentDeviceId) {
+      return res.status(401).json({ error: 'Session is no longer valid. Please sign in again.' });
+    }
     if (user.currentDeviceId && deviceId && user.currentDeviceId !== deviceId) {
       return res.status(403).json({ error: DEVICE_BLOCK_MSG });
     }
     // Keep the active-session window (and with it the single-device lock)
     // sliding while the app is genuinely in use — mirrors the 30d JWT life.
     await User.findByIdAndUpdate(user._id, { lastLoginAt: new Date() });
-    const token = signToken(user);
+    // Carry the owning device into the fresh token (legacy tokens without the
+    // claim upgrade here).
+    const token = signToken(user, deviceId || payload.deviceId);
     const fresh = await User.findById(user._id).lean();
     return res.json({ token, user: fresh });
   } catch (e) {
