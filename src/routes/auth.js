@@ -187,11 +187,37 @@ router.post('/logout', authRequired, async (req, res) => {
     const u = await User.findById(req.user._id);
     if (u && (!deviceId || !u.currentDeviceId || u.currentDeviceId === deviceId)) {
       u.currentDeviceId = '';
+      // The logging-out device's push tokens go with the lock: a signed-out
+      // install must never receive FCM pushes for this account.
+      u.fcmTokens = deviceId
+        ? (u.fcmTokens || []).filter((t) => t.deviceId !== deviceId)
+        : [];
       await u.save();
     }
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ error: 'Logout failed' });
+  }
+});
+
+// POST /api/auth/register-device { token, deviceId } — stores this install's
+// FCM token so messages can reach it while the app is closed. Replaces any
+// older token from the same device (FCM rotates tokens) and caps the list at
+// five devices' worth.
+router.post('/register-device', authRequired, async (req, res) => {
+  try {
+    const token = String(req.body.token || '').trim();
+    const deviceId = String(req.body.deviceId || '').trim();
+    if (!token || token.length > 4096) return res.status(400).json({ error: 'Missing token' });
+    const u = await User.findById(req.user._id);
+    if (!u) return res.status(401).json({ error: 'Unknown user' });
+    const keep = (u.fcmTokens || []).filter((t) => t.token !== token && t.deviceId !== (deviceId || '\u0000'));
+    keep.unshift({ token, deviceId, updatedAt: new Date() });
+    u.fcmTokens = keep.slice(0, 5);
+    await u.save();
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: 'Failed to register device' });
   }
 });
 

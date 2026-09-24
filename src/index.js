@@ -31,6 +31,9 @@ const io = new Server(server, { cors: { origin: '*' } });
 app.set('io', io);
 initSocket(io);
 
+// Closed-app push notifications (FCM) — no-op unless FCM_SERVICE_ACCOUNT is set.
+require('./services/push').initPush();
+
 // Periodic Google Sheets sync so access data stays fresh without manual runs.
 // Failures keep the last good state (handled inside runSync).
 const { runSync } = require('./services/sheetsSync');

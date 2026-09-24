@@ -3,6 +3,7 @@ const User = require('../models/User');
 const Message = require('../models/Message');
 const msgRoutes = require('../routes/messages');
 const { resolveAttachment } = require('../services/attachments');
+const { pushNewMessage } = require('../services/push');
 
 function initSocket(io) {
   io.use(async (socket, next) => {
@@ -165,6 +166,8 @@ function initSocket(io) {
           }
         } catch (_) {}
         io.to(key).emit('message:new', { ...out, _clientId: clientId || undefined });
+        // Closed-app recipients (no live socket in the room) get an FCM push.
+        pushNewMessage(io, key, msg, me);
         ack?.({ ok: true, message: out });
       } catch (e) {
         ack?.({ ok: false, error: 'Send failed' });

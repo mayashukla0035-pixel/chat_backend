@@ -28,6 +28,13 @@ const userSchema = new mongoose.Schema({
   // Single-device login enforcement
   currentDeviceId: { type: String, default: '' },
   lastLoginAt: { type: Date },
+  // FCM registration tokens for closed-app push delivery — scoped per
+  // device; pushes only ever use the token of currentDeviceId (capped).
+  fcmTokens: [{
+    token: { type: String },
+    deviceId: { type: String, default: '' },
+    updatedAt: { type: Date },
+  }],
 }, { timestamps: true });
 
 userSchema.index({ emailNorm: 1, role: 1 }, { unique: true });

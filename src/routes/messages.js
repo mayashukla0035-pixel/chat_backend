@@ -8,6 +8,7 @@ const { authRequired } = require('../middleware/auth');
 const { effectiveAccess, sharesBatchGroup } = require('../services/access');
 const { isSupportAccount } = require('../services/support');
 const { resolveAttachment } = require('../services/attachments');
+const { pushNewMessage } = require('../services/push');
 
 const router = express.Router();
 router.use(authRequired);
@@ -205,6 +206,8 @@ router.post('/forward', async (req, res) => {
     const out = cleanMsg(msg, req.user._id);
     const io = req.app.get('io');
     io?.to(target).emit('message:new', out);
+    // Closed-app recipients (no live socket in the room) get an FCM push.
+    if (io) pushNewMessage(io, target, msg, me);
     return res.json({ message: out });
   } catch (e) {
     console.error(e);
@@ -309,6 +312,8 @@ router.post('/', async (req, res) => {
     } catch (_) {}
     const io = req.app.get('io');
     io?.to(key).emit('message:new', { ...out, _clientId: clientId || undefined });
+    // Closed-app recipients (no live socket in the room) get an FCM push.
+    if (io) pushNewMessage(io, key, msg, me);
     return res.json({ message: out });
   } catch (e) {
     console.error(e);
