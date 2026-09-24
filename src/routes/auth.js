@@ -14,18 +14,25 @@ function makeCode() {
   return String(100000 + (Date.now() % 900000)).padStart(6, '0');
 }
 
-// One account, ONE device at a time: while `currentDeviceId` is set (and the
-// session is not stale — JWTs live 30 days, mirroring signToken), a login
-// attempt from ANY other device is rejected with 403 instead of silently
-// taking over. Logging out (POST /api/auth/logout) clears the lock, which is
-// how a user moves to a new device. The rejection message itself lives in
-// middleware/auth.js and is shared with the per-request device check.
-const SESSION_ACTIVE_MS = 30 * 24 * 60 * 60 * 1000;
-function blockedByOtherDevice(user, deviceId) {
-  if (!deviceId || !user.currentDeviceId || user.currentDeviceId === deviceId) return false;
-  const last = user.lastLoginAt ? new Date(user.lastLoginAt).getTime() : 0;
-  if (last && Date.now() - last > SESSION_ACTIVE_MS) return false; // abandoned lock
-  return true;
+// One account, ONE device at a time: `currentDeviceId` is the device lock.
+// NEW LOGIN WINS — a verified login (OTP / support credentials prove account
+// ownership) always takes over the lock, so an uninstall-reinstall or a new
+// phone can never be locked out by a stale lock. The previous device is
+// evicted by the per-request DEVICE_REPLACED check (its app wipes itself),
+// by /refresh refusal, at the socket handshake, and here on live sockets —
+// so two devices are never ACTIVE at once even though login is never refused.
+function evictLiveSockets(req, userId) {
+  try {
+    const io = req.app.get('io');
+    if (!io) return;
+    const id = String(userId);
+    // The handshake check only guards NEW connections — an already-open
+    // socket of the replaced device must be cut here, or it would keep
+    // receiving (and sending) under the evicted session.
+    for (const s of io.sockets.sockets.values()) {
+      if (s.user && String(s.user._id) === id) s.disconnect(true);
+    }
+  } catch (_) {}
 }
 
 // POST /api/auth/request-otp { email, teacherId? }
@@ -51,13 +58,10 @@ router.post('/request-otp', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'No SkillParkho account found for this email.' });
     if (user.status !== 'Active') return res.status(403).json({ error: 'Your account is inactive.' });
 
-    // Single-device: reject a SECOND device outright while this account's
-    // session on another device is still active — fails fast, before the
-    // user ever types an OTP (same rule enforced again at verify-otp).
+    // Single-device: no rejection HERE — the lock is only ever contested at
+    // the verified step (verify-otp / support direct token), where the new
+    // device takes it over.
     const reqDeviceId = String(req.body.deviceId || '').trim();
-    if (blockedByOtherDevice(user, reqDeviceId)) {
-      return res.status(403).json({ error: DEVICE_BLOCK_MSG });
-    }
 
     const wantsTeacher = user.role === 'teacher' || !!teacherId;
     if (wantsTeacher) {
@@ -73,8 +77,12 @@ router.post('/request-otp', async (req, res) => {
       // Same contract as verify-otp/support-login: record the device lock so
       // the direct-token session is single-device too.
       const upd = { lastLoginAt: new Date() };
-      if (reqDeviceId) upd.currentDeviceId = reqDeviceId;
+      if (reqDeviceId) {
+        upd.currentDeviceId = reqDeviceId;
+        upd.fcmTokens = (user.fcmTokens || []).filter((t) => t && t.deviceId === reqDeviceId);
+      }
       await User.findByIdAndUpdate(user._id, upd);
+      evictLiveSockets(req, user._id);
       const token = signToken(user, reqDeviceId);
       return res.json({ ok: true, directToken: token, user });
     }
@@ -103,8 +111,8 @@ router.post('/request-otp', async (req, res) => {
 });
 
 // POST /api/auth/verify-otp { email, code, deviceId? } -> { token, user }
-// Enforces single-device login: a SECOND device is REJECTED (403) while the
-// account's session on another device is active — never a silent takeover.
+// NEW LOGIN WINS: the OTP proves account ownership, so a verified login
+// always takes over the single-device lock — login is never refused.
 router.post('/verify-otp', async (req, res) => {
   try {
     const email = norm(req.body.email);
@@ -118,17 +126,17 @@ router.post('/verify-otp', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Account not found.' });
     if (user.status !== 'Active') return res.status(403).json({ error: 'Your account is inactive.' });
     
-    // Single-device login: a SECOND device is REJECTED while this account's
-    // session on another device is still active — never a silent takeover.
-    // (Logging out on the first device clears currentDeviceId and unblocks.)
-    if (blockedByOtherDevice(user, deviceId)) {
-      return res.status(403).json({ error: DEVICE_BLOCK_MSG });
-    }
-    
     await OtpSession.deleteMany({ emailNorm: email });
     const update = { lastLoginAt: new Date() };
-    if (deviceId) update.currentDeviceId = deviceId;
+    if (deviceId) {
+      update.currentDeviceId = deviceId;
+      // Takeover cleanup: drop the evicted device's push tokens (they can
+      // never be used again — pushes only target the lock-owning device).
+      // Same-device re-login keeps its own tokens.
+      update.fcmTokens = (user.fcmTokens || []).filter((t) => t && t.deviceId === deviceId);
+    }
     await User.findByIdAndUpdate(user._id, update);
+    evictLiveSockets(req, user._id);
     const token = signToken(user, deviceId);
     const updatedUser = await User.findById(user._id).lean();
     return res.json({ ok: true, token, user: updatedUser });
@@ -155,15 +163,15 @@ router.post('/support-login', async (req, res) => {
       return res.status(403).json({ error: 'Support account not available.' });
     }
     
-    // Single-device: same hard rejection as verify-otp — a second device
-    // cannot sign the support account in while another session is active.
-    if (blockedByOtherDevice(user, deviceId)) {
-      return res.status(403).json({ error: DEVICE_BLOCK_MSG });
-    }
-    
+    // Same new-login-wins rule as verify-otp: the support credentials are
+    // full proof, so the lock is taken over and any previous device evicted.
     const update = { lastLoginAt: new Date() };
-    if (deviceId) update.currentDeviceId = deviceId;
+    if (deviceId) {
+      update.currentDeviceId = deviceId;
+      update.fcmTokens = (user.fcmTokens || []).filter((t) => t && t.deviceId === deviceId);
+    }
     await User.findByIdAndUpdate(user._id, update);
+    evictLiveSockets(req, user._id);
     
     const token = signToken(user, deviceId);
     const updatedUser = await User.findById(user._id).lean();

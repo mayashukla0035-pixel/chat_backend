@@ -11,7 +11,10 @@
 //                               string (Railway environment variable).
 //   GOOGLE_APPLICATION_CREDENTIALS — path to that JSON file (local dev).
 // Without either, the backend runs exactly as before with push disabled.
-const admin = require('firebase-admin');
+// firebase-admin v14 dropped the legacy root namespace (admin.credential no
+// longer exists) — the modular API is the supported shape across v10+.
+const { initializeApp, cert, applicationDefault } = require('firebase-admin/app');
+const { getMessaging } = require('firebase-admin/messaging');
 const User = require('../models/User');
 const Membership = require('../models/Membership');
 const Group = require('../models/Group');
@@ -23,9 +26,9 @@ function initPush() {
   try {
     const raw = process.env.FCM_SERVICE_ACCOUNT;
     if (raw) {
-      admin.initializeApp({ credential: admin.credential.cert(JSON.parse(raw)) });
+      initializeApp({ credential: cert(JSON.parse(raw)) });
     } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-      admin.initializeApp({ credential: admin.credential.applicationDefault() });
+      initializeApp({ credential: applicationDefault() });
     } else {
       console.log('[push] FCM not configured (set FCM_SERVICE_ACCOUNT) — push notifications disabled');
       return;
@@ -123,7 +126,7 @@ async function pushNewMessage(io, key, msg, sender) {
     }
     const body = previewBody(msg);
 
-    const res = await admin.messaging().sendEachForMulticast({
+    const res = await getMessaging().sendEachForMulticast({
       tokens,
       data: { conversationKey: key, messageId: String(msg._id), kind: 'message' },
       notification: { title, body },
