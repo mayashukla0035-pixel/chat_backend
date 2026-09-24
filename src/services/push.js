@@ -20,6 +20,12 @@ const Membership = require('../models/Membership');
 const Group = require('../models/Group');
 
 let ready = false;
+// Diagnostics surfaced on GET /health so a broken push config is visible
+// without digging through logs: 'unconfigured' | 'failed' | 'ready'.
+let initState = 'unconfigured';
+let initError = '';
+let lastSendError = '';
+let lastSendAt = 0;
 
 function initPush() {
   if (ready) return;
@@ -30,12 +36,18 @@ function initPush() {
     } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
       initializeApp({ credential: applicationDefault() });
     } else {
+      initState = 'unconfigured';
+      initError = 'FCM_SERVICE_ACCOUNT / GOOGLE_APPLICATION_CREDENTIALS not set';
       console.log('[push] FCM not configured (set FCM_SERVICE_ACCOUNT) — push notifications disabled');
       return;
     }
     ready = true;
+    initState = 'ready';
+    initError = '';
     console.log('[push] FCM initialized');
   } catch (e) {
+    initState = 'failed';
+    initError = String((e && e.message) || e).slice(0, 300);
     console.log('[push] FCM init failed:', e.message);
   }
 }
@@ -143,21 +155,35 @@ async function pushNewMessage(io, key, msg, sender) {
     });
 
     // Drop tokens FCM says are gone (uninstalled / reinstalled app) so a
-    // user's capped token list never fills with corpses.
+    // user's capped token list never fills with corpses. Anything else FCM
+    // rejects (wrong project, bad credential…) would otherwise vanish
+    // silently — surface it on /health instead.
     const dead = [];
+    const bad = [];
     res.responses.forEach((r, i) => {
       const code = r.error && r.error.code;
       if (code === 'messaging/registration-token-not-registered' ||
           code === 'messaging/invalid-registration-token') {
         dead.push(tokens[i]);
+      } else if (r.error) {
+        bad.push(`${String(code || r.error.message).slice(0, 120)}@${i}`);
       }
     });
+    lastSendError = bad.length ? bad.slice(0, 3).join(' | ') : '';
+    lastSendAt = Date.now();
     if (dead.length) {
       await User.updateMany({}, { $pull: { fcmTokens: { token: { $in: dead } } } });
     }
   } catch (e) {
+    lastSendError = String((e && e.message) || e).slice(0, 300);
+    lastSendAt = Date.now();
     console.log('[push] send failed:', e.message);
   }
 }
 
-module.exports = { initPush, pushNewMessage };
+// Push health for GET /health: config state + last send outcome.
+function pushStatus() {
+  return { state: initState, initError, lastSendError, lastSendAt };
+}
+
+module.exports = { initPush, pushNewMessage, pushStatus };

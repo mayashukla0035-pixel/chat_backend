@@ -16,7 +16,8 @@ const uploadDir = process.env.UPLOAD_DIR || './uploads';
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 app.use('/uploads', express.static(path.resolve(uploadDir)));
 
-app.get('/health', (req, res) => res.json({ ok: true, service: 'skillparkho-backend' }));
+app.get('/health', (req, res) =>
+  res.json({ ok: true, service: 'skillparkho-backend', push: require('./services/push').pushStatus() }));
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/conversations', require('./routes/conversations'));
 app.use('/api/teachers', require('./routes/teachers'));
