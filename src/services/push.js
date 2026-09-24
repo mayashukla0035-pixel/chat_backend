@@ -145,7 +145,10 @@ async function pushNewMessage(io, key, msg, sender) {
       android: {
         priority: 'high',
         notification: {
-          channelId: 'chat_push',
+          // chat_push2: channel whose sound is BUNDLED with the app — the
+          // old chat_push used the device's default notification tone, which
+          // can be a broken/missing file and then the push posts SILENT.
+          channelId: 'chat_push2',
           title,
           body,
           sound: 'default',
