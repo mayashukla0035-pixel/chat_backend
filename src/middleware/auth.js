@@ -6,6 +6,7 @@ const User = require('../models/User');
 const DEVICE_BLOCK_MSG =
   'This account is already signed in on another device. Log out there first, then sign in here.';
 
+  
 // The device that owns the session is embedded in the JWT, so EVERY
 // authenticated call can prove which device holds it. Legacy tokens minted
 // before this claim existed carry no deviceId and are grandfathered: they are
