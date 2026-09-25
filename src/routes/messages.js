@@ -330,11 +330,19 @@ router.post('/read', async (req, res) => {
     const key = String(req.body.conversation || '');
     const check = await canReadConversation(me, key);
     if (!check.ok) return res.status(403).json({ error: 'Not authorized' });
-    const msgs = await Message.find({
+    // `before` (client ms timestamp of when the user actually read the chat)
+    // bounds the receipt: a stale 'read' action replayed at the next app open
+    // only marks messages that existed at that moment — anything received
+    // after (e.g. while the app was reopening) stays UNREAD. Absent = legacy
+    // blanket mark of every unread message in the conversation.
+    const filter = {
       conversationKey: key,
       sender: { $ne: me._id },
       reads: { $ne: me._id },
-    }).limit(100).select('_id').lean();
+    };
+    const before = Number(req.body.before);
+    if (Number.isFinite(before) && before > 0) filter.createdAt = { $lte: new Date(before) };
+    const msgs = await Message.find(filter).limit(100).select('_id').lean();
     const ids = msgs.map((m) => m._id);
     if (ids.length) {
       await Message.updateMany(
