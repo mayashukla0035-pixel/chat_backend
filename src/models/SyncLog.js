@@ -13,4 +13,7 @@ const syncLogSchema = new mongoose.Schema({
   warnings: [String],
 }, { timestamps: true });
 
+// /api/sync/status sorts on createdAt — indexed so it never scans.
+syncLogSchema.index({ createdAt: -1 });
+
 module.exports = mongoose.model('SyncLog', syncLogSchema);

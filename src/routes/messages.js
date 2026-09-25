@@ -9,6 +9,7 @@ const { effectiveAccess, sharesBatchGroup } = require('../services/access');
 const { isSupportAccount } = require('../services/support');
 const { resolveAttachment } = require('../services/attachments');
 const { pushNewMessage } = require('../services/push');
+const { cachedGroups } = require('../services/groupCache');
 
 const router = express.Router();
 router.use(authRequired);
@@ -106,8 +107,7 @@ async function canReadConversation(me, conversationKey) {
     // batch), so exempt it.
     if ((isSupportAccount(me) || me.role === 'supportAdmin') && other.role === 'student') return { ok: true };
     if (me.role === 'student' && (isSupportAccount(other) || other.role === 'supportAdmin')) return { ok: true };
-    const groups = await Group.find({}).lean();
-    const m = new Map(groups.map((g) => [g.groupId, g]));
+    const { m } = await cachedGroups();
     let shared = null;
     if (me.role === 'student' && other.role === 'teacher') {
       // Reads stay allowed when Teacher Chat Access is FALSE so history is
@@ -250,7 +250,7 @@ router.post('/', async (req, res) => {
     const key = String(req.body.conversation || '');
     const check = await canSendInConversation(me, key);
     if (!check.ok) return res.status(403).json({ error: check.reason || 'You cannot send in this conversation.' });
-    const content = String(req.body.content || '').slice(0, 4000);
+    const content = String(req.body.content || '').slice(0, 20000);
     if (!content.trim() && !req.body.attachment && !req.body.poll) {
       return res.status(400).json({ error: 'Empty message' });
     }
@@ -439,11 +439,25 @@ router.post('/:id/react', async (req, res) => {
     const check = await canReadConversation(req.user, msg.conversationKey);
     if (!check.ok) return res.status(403).json({ error: 'Not authorized' });
     const emoji = String(req.body.emoji || '').slice(0, 8);
-    msg.reactions = (msg.reactions || []).filter((r) => String(r.userId) !== String(req.user._id));
-    msg.reactions.push({ emoji, userId: req.user._id, userName: req.user.name });
-    await msg.save();
-    req.app.get('io')?.to(msg.conversationKey).emit('message:updated', cleanMsg(msg, req.user._id));
-    return res.json({ message: cleanMsg(msg, req.user._id) });
+    // Atomic swap of MY reaction (aggregation-pipeline update): two devices
+    // reacting at once can no longer clobber each other's array write, and
+    // the reaction write itself is a single indexed update instead of a
+    // load-modify-save of the whole document.
+    const updated = await Message.findOneAndUpdate(
+      { _id: req.params.id },
+      [{ $set: { reactions: { $concatArrays: [
+        { $filter: {
+          input: { $ifNull: ['$reactions', []] },
+          as: 'r',
+          cond: { $ne: ['$$r.userId', req.user._id] },
+        } },
+        [{ emoji, userId: req.user._id, userName: req.user.name }],
+      ] } } }],
+      { new: true },
+    );
+    if (!updated) return res.status(404).json({ error: 'Not found' });
+    req.app.get('io')?.to(updated.conversationKey).emit('message:updated', cleanMsg(updated, req.user._id));
+    return res.json({ message: cleanMsg(updated, req.user._id) });
   } catch (e) {
     return res.status(500).json({ error: 'Failed to react' });
   }

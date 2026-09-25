@@ -221,7 +221,7 @@ async function runSync() {
 // row of the Students/Teachers tabs, and with what status? Returns null when
 // the sheet is unreachable or not configured, so callers fall back to the
 // last synchronized DB state — a network hiccup must never log anyone out.
-async function checkUserInSheet(email) {
+async function checkUserInSheetLive(email) {
   const spreadsheetId = process.env.GOOGLE_SHEET_ID;
   const target = norm(email);
   if (!spreadsheetId || !target) return null;
@@ -244,4 +244,47 @@ async function checkUserInSheet(email) {
   }
 }
 
-module.exports = { runSync, checkUserInSheet };
+// Per-account TTL cache: validate-session runs on EVERY app open and a live
+// check downloads both sheet tabs (Students + Teachers). Caching the result
+// for SHEET_CHECK_TTL_SECONDS keeps that path cheap under load while a block
+// or removal still takes effect within the TTL (default 2 minutes). A live
+// failure falls back to the last cached answer, never to a logout.
+const _sheetCheckCache = new Map();
+const SHEET_CHECK_TTL_MS = Number(process.env.SHEET_CHECK_TTL_SECONDS || 120) * 1000;
+
+async function checkUserInSheet(email) {
+  const key = norm(email);
+  if (!key) return null;
+  const hit = _sheetCheckCache.get(key);
+  if (hit && Date.now() - hit.at < SHEET_CHECK_TTL_MS) return hit.val;
+  try {
+    const val = await checkUserInSheetLive(key);
+    if (val !== null) _sheetCheckCache.set(key, { at: Date.now(), val });
+    return val;
+  } catch (_) {
+    return hit ? hit.val : null;
+  }
+}
+
+// Throttled, single-flight sync trigger for request-path callers (login,
+// unknown-email catch-up, periodic job). Never blocks the caller when used
+// fire-and-forget, never runs two syncs at once, and coalesces concurrent
+// triggers into the in-flight run.
+let _syncInFlight = null;
+let _lastSyncAt = 0;
+
+async function maybeRunSync(minAgeMs = 4 * 60000) {
+  if (_syncInFlight) return _syncInFlight;
+  if (Date.now() - _lastSyncAt < minAgeMs) return null;
+  _syncInFlight = runSync()
+    .then((log) => { _lastSyncAt = Date.now(); return log; })
+    .catch((e) => {
+      console.log('[sync] background sync failed, keeping last good state:', e.message);
+      _lastSyncAt = Date.now();
+      return null;
+    })
+    .finally(() => { _syncInFlight = null; });
+  return _syncInFlight;
+}
+
+module.exports = { runSync, maybeRunSync, checkUserInSheet };

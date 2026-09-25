@@ -4,7 +4,7 @@ const User = require('../models/User');
 const OtpSession = require('../models/OtpSession');
 const { signToken, DEVICE_BLOCK_MSG } = require('../middleware/auth');
 const { sendOtpEmail } = require('../services/mailer');
-const { runSync, checkUserInSheet } = require('../services/sheetsSync');
+const { maybeRunSync, checkUserInSheet } = require('../services/sheetsSync');
 const { ensureSupportAccount, isSupportCredentials, isSupportAccount } = require('../services/support');
 
 const router = express.Router();
@@ -43,18 +43,27 @@ router.post('/request-otp', async (req, res) => {
     if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
       return res.status(400).json({ error: 'Please enter a valid email address.' });
     }
-    // Verify against the live sheet first, so newly added/blocked users take
-    // effect immediately. A sync failure falls back to the last good DB state
-    // and must never block login (spec: retain last synchronized state).
-    try {
-      await runSync();
-    } catch (e) {
-      console.log('[auth] pre-login sync failed, using last good state:', e.message);
-    }
+    // Sheet freshness now happens in the BACKGROUND: a full sync on this
+    // request path (hundreds of sequential DB roundtrips) made responses take
+    // 15s+, so the client timed out with "server isn't reachable" even though
+    // the OTP was eventually delivered. Login reads the last good DB state,
+    // which the 5-minute interval keeps fresh. Unknown emails get ONE
+    // coalesced catch-up sync (at most once a minute) so brand-new sheet rows
+    // still log in promptly.
+    maybeRunSync(); // fire-and-forget
     // The SkillParkho Support teacher is created/kept from .env config, not
     // from the sheet, and logs in WITHOUT an OTP (see below).
     await ensureSupportAccount();
-    const user = await User.findOne({ emailNorm: email });
+    let user = await User.findOne({ emailNorm: email });
+    if (!user) {
+      // Unknown email: the periodic sync may not have picked up a brand-new
+      // sheet row yet. Give it one coalesced catch-up run (at most one per
+      // minute, shared across concurrent requests) and re-check, so a fresh
+      // sheet row can still log in on first try without putting a full sync
+      // on every login request.
+      await maybeRunSync(60000);
+      user = await User.findOne({ emailNorm: email });
+    }
     if (!user) return res.status(404).json({ error: 'No SkillParkho account found for this email.' });
     if (user.status !== 'Active') return res.status(403).json({ error: 'Your account is inactive.' });
 

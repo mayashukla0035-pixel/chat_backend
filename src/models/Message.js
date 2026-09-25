@@ -67,6 +67,10 @@ const messageSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 messageSchema.index({ conversationKey: 1, createdAt: 1 });
+// Direct-chat discovery: every direct list/lookup filters on participantIds
+// (multikey) and reads directKey off the same index — without this the
+// conversation list COLLSCAN'd the entire messages collection.
+messageSchema.index({ participantIds: 1, directKey: 1 });
 // Exact-once delivery: one message per clientId — GLOBALLY, regardless of
 // sender. The CSPRNG client ids are unique per logical send, so this is safe,
 // and it is what kills the cross-account echo: a stale REST fallback posted

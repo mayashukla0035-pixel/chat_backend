@@ -103,11 +103,9 @@ async function pushNewMessage(io, key, msg, sender) {
     const senderId = String((sender && sender._id) || sender || '');
     const ids = await recipientIds(key, senderId);
     if (!ids.length) return;
-    const users = await User.find({ _id: { $in: ids } })
-      .select('name notificationsEnabled currentDeviceId fcmTokens')
-      .lean();
-    if (!users.length) return;
-    // Live sockets in this room already show an in-app notification.
+    // Live sockets in this room already ring locally — check BEFORE the user
+    // query, so an all-online room (the common case in busy groups) costs no
+    // user lookups at all.
     let online = new Set();
     try {
       const sockets = await io.in(key).fetchSockets();
@@ -115,11 +113,16 @@ async function pushNewMessage(io, key, msg, sender) {
         .map((s) => (s.user && s.user._id ? String(s.user._id) : ''))
         .filter(Boolean));
     } catch (_) {}
+    const offlineIds = ids.filter((id) => !online.has(id));
+    if (!offlineIds.length) return;
+    const users = await User.find({ _id: { $in: offlineIds } })
+      .select('name notificationsEnabled currentDeviceId fcmTokens')
+      .lean();
+    if (!users.length) return;
 
     const tokens = [];
     for (const u of users) {
       if (u.notificationsEnabled === false) continue;
-      if (online.has(String(u._id))) continue;
       // No lock = logged out = silent; tokens from a device that no longer
       // owns the lock are stale and must not ring.
       if (!u.currentDeviceId || !Array.isArray(u.fcmTokens)) continue;
@@ -138,44 +141,53 @@ async function pushNewMessage(io, key, msg, sender) {
     }
     const body = previewBody(msg);
 
-    const res = await getMessaging().sendEachForMulticast({
-      tokens,
-      data: { conversationKey: key, messageId: String(msg._id), kind: 'message' },
-      notification: { title, body },
-      android: {
-        priority: 'high',
-        notification: {
-          // chat_push2: channel whose sound is BUNDLED with the app — the
-          // old chat_push used the device's default notification tone, which
-          // can be a broken/missing file and then the push posts SILENT.
-          channelId: 'chat_push2',
-          title,
-          body,
-          sound: 'default',
-          clickAction: 'FLUTTER_NOTIFICATION_CLICK',
-        },
-      },
-    });
-
-    // Drop tokens FCM says are gone (uninstalled / reinstalled app) so a
-    // user's capped token list never fills with corpses. Anything else FCM
-    // rejects (wrong project, bad credential…) would otherwise vanish
-    // silently — surface it on /health instead.
+    // FCM multicast accepts at most 500 tokens per call — a big group would
+    // otherwise reject the whole batch. Chunks run sequentially to keep error
+    // accounting simple (the token budget per user is tiny anyway).
     const dead = [];
     const bad = [];
-    res.responses.forEach((r, i) => {
-      const code = r.error && r.error.code;
-      if (code === 'messaging/registration-token-not-registered' ||
-          code === 'messaging/invalid-registration-token') {
-        dead.push(tokens[i]);
-      } else if (r.error) {
-        bad.push(`${String(code || r.error.message).slice(0, 120)}@${i}`);
-      }
-    });
+    const CHUNK = 500;
+    for (let i = 0; i < tokens.length; i += CHUNK) {
+      const res = await getMessaging().sendEachForMulticast({
+        tokens: tokens.slice(i, i + CHUNK),
+        data: { conversationKey: key, messageId: String(msg._id), kind: 'message' },
+        notification: { title, body },
+        android: {
+          priority: 'high',
+          notification: {
+            // chat_push2: channel whose sound is BUNDLED with the app — the
+            // old chat_push used the device's default notification tone, which
+            // can be a broken/missing file and then the push posts SILENT.
+            channelId: 'chat_push2',
+            title,
+            body,
+            sound: 'default',
+            clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+          },
+        },
+      });
+      // Drop tokens FCM says are gone (uninstalled / reinstalled app) so a
+      // user's capped token list never fills with corpses. Anything else FCM
+      // rejects (wrong project, bad credential…) would otherwise vanish
+      // silently — surface it on /health instead.
+      res.responses.forEach((r, j) => {
+        const code = r.error && r.error.code;
+        if (code === 'messaging/registration-token-not-registered' ||
+            code === 'messaging/invalid-registration-token') {
+          dead.push(tokens[i + j]);
+        } else if (r.error) {
+          bad.push(`${String(code || r.error.message).slice(0, 120)}@${i + j}`);
+        }
+      });
+    }
     lastSendError = bad.length ? bad.slice(0, 3).join(' | ') : '';
     lastSendAt = Date.now();
     if (dead.length) {
-      await User.updateMany({}, { $pull: { fcmTokens: { token: { $in: dead } } } });
+      // Scoped to the recipients just queried — never a full-collection scan.
+      await User.updateMany(
+        { _id: { $in: offlineIds } },
+        { $pull: { fcmTokens: { token: { $in: dead } } } }
+      );
     }
   } catch (e) {
     lastSendError = String((e && e.message) || e).slice(0, 300);

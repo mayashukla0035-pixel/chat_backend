@@ -4,6 +4,7 @@ const Group = require('../models/Group');
 const { authRequired } = require('../middleware/auth');
 const { sharesBatchGroup, studentBatchGroups, teacherBatchGroups } = require('../services/access');
 const { isSupportAccount } = require('../services/support');
+const { cachedGroups } = require('../services/groupCache');
 
 const router = express.Router();
 router.use(authRequired);
@@ -45,8 +46,7 @@ router.get('/search', async (req, res) => {
     const me = req.user;
     const q = String(req.query.q || '').trim().toLowerCase();
     if (!q) return res.json({ teachers: [], students: [] });
-    const groups = await Group.find({}).lean();
-    const m = new Map(groups.map((g) => [g.groupId, g]));
+    const { m } = await cachedGroups();
     const rx = new RegExp(escapeRx(q), 'i');
     const out = { teachers: [], students: [] };
 
@@ -129,12 +129,10 @@ router.get('/:id', async (req, res) => {
     if (me.role === 'supportAdmin') ok = true;
     else if (isSupportAccount(me)) ok = true;
     else if (me.role === 'teacher' && target.role === 'student') {
-      const groups = await Group.find({}).lean();
-      const m = new Map(groups.map((g) => [g.groupId, g]));
+      const { m } = await cachedGroups();
       ok = !!(await sharesBatchGroup(target.emailNorm, me.emailNorm, m));
     } else if (me.role === 'student' && target.role === 'teacher') {
-      const groups = await Group.find({}).lean();
-      const m = new Map(groups.map((g) => [g.groupId, g]));
+      const { m } = await cachedGroups();
       ok = !!(await sharesBatchGroup(me.emailNorm, target.emailNorm, m));
       if (ok) {
         // Privacy: a student may only ever see a teacher's NAME, SUBJECT and

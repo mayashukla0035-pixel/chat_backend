@@ -3,6 +3,7 @@ const User = require('../models/User');
 const Group = require('../models/Group');
 const { authRequired } = require('../middleware/auth');
 const { sharesBatchGroup } = require('../services/access');
+const { cachedGroups } = require('../services/groupCache');
 
 const router = express.Router();
 router.use(authRequired);
@@ -17,8 +18,7 @@ router.get('/search', async (req, res) => {
     if (!q) return res.json({ teachers: [] });
     const teacher = await User.findOne({ usernameNorm: q, role: 'teacher', status: 'Active' }).lean();
     if (!teacher) return res.json({ teachers: [] });
-    const groups = await Group.find({}).lean();
-    const m = new Map(groups.map((g) => [g.groupId, g]));
+    const { m } = await cachedGroups();
     const shared = await sharesBatchGroup(me.emailNorm, teacher.emailNorm, m);
     if (!shared) return res.json({ teachers: [] }); // hide teachers with no shared authorized group
     return res.json({ teachers: [{ id: teacher._id, name: teacher.name, username: teacher.username, subject: teacher.subject, avatarUrl: teacher.avatarUrl, isVerified: teacher.isVerified }] });

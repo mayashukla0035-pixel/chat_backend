@@ -38,7 +38,13 @@ function initSocket(io) {
         const key = String(conversationKey);
         const check = await msgRoutes.canReadConversation(me, key);
         if (!check.ok) return ack?.({ ok: false, error: 'Not authorized' });
+        // Rejoin guard: a reconnect storm (or connection-state recovery
+        // replay) re-fires 'join' for rooms the socket is already in — the
+        // delivered-backfill below is a full conversation scan, so running it
+        // once per socket instead of once per join event matters at scale.
+        const already = socket.rooms.has(key);
         socket.join(key);
+        if (already) return ack?.({ ok: true });
         // Receipt: joining = this device received the room. Mark other people's
         // messages delivered and notify senders of the most recent ones so
         // their ticks advance to double ✓ even when they sent while offline.
@@ -94,7 +100,7 @@ function initSocket(io) {
         const key = String(payload?.conversation || '');
         const check = await msgRoutes.canSendInConversation(me, key);
         if (!check.ok) return ack?.({ ok: false, error: check.reason || 'Cannot send here' });
-        const content = String(payload?.content || '').slice(0, 4000);
+        const content = String(payload?.content || '').slice(0, 20000);
         if (!content.trim() && !payload?.attachment && !payload?.poll) {
           return ack?.({ ok: false, error: 'Empty message' });
         }
@@ -175,7 +181,13 @@ function initSocket(io) {
     });
 
     socket.on('typing', (key) => {
-      socket.to(String(key)).emit('typing', { userId: String(me._id), name: me.name });
+      const k = String(key);
+      // Only relay typing into rooms this socket actually joined — otherwise
+      // any connected client could inject typing events into arbitrary
+      // conversations (socket.to(room) emits regardless of the sender's
+      // membership).
+      if (!socket.rooms.has(k)) return;
+      socket.to(k).emit('typing', { userId: String(me._id), name: me.name });
     });
   });
 }

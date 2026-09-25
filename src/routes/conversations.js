@@ -7,27 +7,51 @@ const DirectVisibility = require('../models/DirectVisibility');
 const { authRequired } = require('../middleware/auth');
 const { sharesBatchGroup } = require('../services/access');
 const { supportEmail, isSupportAccount } = require('../services/support');
+const { cachedGroups } = require('../services/groupCache');
 
 const router = express.Router();
 router.use(authRequired);
 
 const normId = (v) => String(v || '').trim().toLowerCase();
 
-// Unread count: messages in this conversation sent by someone else that the
-// caller has not read yet (their id not in the message's `reads` array).
-async function unreadFor(me, conversationKey) {
-  return Message.countDocuments({
-    conversationKey,
-    sender: { $ne: me._id },
-    reads: { $ne: me._id },
-  });
+// Batched last-message + unread computation for a SET of conversation keys.
+// This replaces the per-key pair of findOne(latest) + countDocuments(unread)
+// that used to run 2 queries PER conversation on every app open. One
+// aggregation resolves all of them: the $sort matches the
+// { conversationKey, createdAt } index exactly, so it streams from the index
+// (no in-memory sort, no 100MB limit), takes $last as the latest message, and
+// accumulates the unread flag (sent by someone else AND my id not in reads)
+// in the same pass.
+async function lastAndUnreadByKeys(keys, meId) {
+  const out = new Map();
+  const uniq = [...new Set(keys.map(String))];
+  if (!uniq.length) return out;
+  const rows = await Message.aggregate([
+    { $match: { conversationKey: { $in: uniq } } },
+    { $sort: { conversationKey: 1, createdAt: 1 } },
+    { $group: {
+      _id: '$conversationKey',
+      last: { $last: '$$ROOT' },
+      unread: { $sum: { $cond: [
+        { $and: [
+          { $ne: ['$sender', meId] },
+          { $not: { $in: [meId, { $ifNull: ['$reads', []] }] } },
+        ] },
+        1,
+        0,
+      ] } },
+    } },
+  ]);
+  for (const r of rows) out.set(String(r._id), { last: r.last, unread: r.unread });
+  for (const k of uniq) if (!out.has(k)) out.set(k, { last: null, unread: 0 });
+  return out;
 }
 
-// Build group map once per request
+// Build group map once per request (served from the shared short-TTL cache —
+// groups only change on sync, but were re-loaded from Mongo on every request).
 async function groupMap() {
-  const groups = await Group.find({}).lean();
-  const m = new Map(groups.map((g) => [g.groupId, g]));
-  return { groups, m };
+  const { list, map } = await cachedGroups();
+  return { groups: list, m: map };
 }
 
 // groupId -> [teacher objectId strings with membership access], precomputed so
@@ -77,7 +101,46 @@ router.get('/', async (req, res) => {
     const { groups, m } = await groupMap();
     const authByGroup = await authorizedTeachersByGroup();
     const memberCounts = await memberCountsByGroup(groups.map((g) => g.groupId));
-    const out = [];
+
+    // Rows are collected as specs first; lastMessage + unread resolve in ONE
+    // cached aggregation pass (statsFor) at the end — the old code issued
+    // findOne + countDocuments PER conversation on every app open.
+    const specs = [];
+    const statsCache = new Map();
+    const statsFor = async (keys) => {
+      const missing = [...new Set(keys.map(String))].filter((k) => !statsCache.has(k));
+      if (missing.length) {
+        const r = await lastAndUnreadByKeys(missing, me._id);
+        for (const [k, v] of r) statsCache.set(k, v);
+      }
+      return statsCache;
+    };
+    const add = (key, row, fallbackText = '') => specs.push({ key, row, fallbackText });
+
+    // Distinct direct-chat counterpart ids for the caller: one distinct() over
+    // the participantIds index instead of loading EVERY direct message body
+    // (the old query pulled the full message history just to find peers).
+    const directCounterparts = async () => {
+      const keys = await Message.distinct('directKey', { participantIds: me._id });
+      const meId = String(me._id);
+      const seen = new Set();
+      const ids = [];
+      for (const k of keys) {
+        const s = String(k || '');
+        if (!s.startsWith('direct:')) continue;
+        const other = s.slice(7).split(':').find((x) => x && x !== meId);
+        if (!other || seen.has(other)) continue;
+        seen.add(other);
+        ids.push(other);
+      }
+      return ids;
+    };
+    // One visibility query for a batch of direct keys -> map(key -> row).
+    const directVis = async (keys) => {
+      if (!keys.length) return new Map();
+      const rows = await DirectVisibility.find({ directKey: { $in: keys } }).lean();
+      return new Map(rows.map((v) => [String(v.directKey), v]));
+    };
 
     if (me.role === 'student') {
       // SUPPORT (student-only): every Active student gets a plain DIRECT chat
@@ -87,63 +150,71 @@ router.get('/', async (req, res) => {
         const support = await User.findOne({ emailNorm: supportEmail(), role: 'teacher', status: 'Active' }).lean();
         if (support) {
           const key = `direct:${[String(me._id), String(support._id)].sort().join(':')}`;
-          const last = await Message.findOne({ conversationKey: key }).sort({ createdAt: -1 }).lean();
-          out.push({
+          add(key, {
             id: key, kind: 'direct', title: 'SkillParkho Support',
             subtitle: 'Official SkillParkho Support',
             peerId: String(support._id), peerUsername: support.username,
             avatarUrl: support.avatarUrl || '',
             status: 'Active', readOnly: false,
-            lastMessage: last?.content || 'How can our team assist you today?',
-            lastMessageAt: last?.createdAt || null,
-            lastMessageSenderId: String(last?.sender || ''),
-            unread: await unreadFor(me, key),
-          });
+          }, 'How can our team assist you today?');
         }
       }
       // BATCH (membership TRUE + group Active) — normal two-way group chats.
       const rels = await Membership.find({ kind: 'student', emailNorm: me.emailNorm, access: true }).lean();
+      const myGroupIds = new Set(rels.map((r) => r.groupId));
       for (const r of rels) {
         const g = m.get(r.groupId);
         if (!g || g.status !== 'Active' || g.type !== 'BATCH') continue;
-        const last = await Message.findOne({ conversationKey: `group:${g.groupId}` }).sort({ createdAt: -1 }).lean();
-        out.push({
+        add(`group:${g.groupId}`, {
           id: g.groupId, kind: 'batch', title: g.name,
           subtitle: g.batchCode ? `Group ${g.batchCode}` : 'Group chat',
           groupId: g.groupId, status: g.status, batchCode: g.batchCode,
           memberCount: memberCounts.get(g.groupId) || 0, avatarUrl: g.avatarUrl || '',
           authorizedTeacherIds: authByGroup.get(g.groupId) || [],
-          lastMessage: last?.content || '', lastMessageAt: last?.createdAt || null,
-          lastMessageSenderId: String(last?.sender || ''),
-          unread: await unreadFor(me, `group:${g.groupId}`),
         });
       }
       // DIRECT teacher chats: only where shared authorized BATCH group exists +
       // teacher Active. Included even when the student's Teacher Chat Access
       // is FALSE — those stay visible as read-only history (never deleted).
       {
-        const directs = await Message.find({ directKey: { $exists: true }, participantIds: me._id }).lean();
-        const seen = new Set();
-        for (const d of directs) {
-          const otherId = (d.participantIds || []).map(String).find((x) => x !== String(me._id));
-          if (!otherId || seen.has(otherId)) continue;
-          seen.add(otherId);
-          const teacher = await User.findById(otherId).lean();
-          if (!teacher || teacher.role !== 'teacher' || teacher.status !== 'Active') continue;
-          if (isSupportAccount(teacher)) continue; // support chat already listed above
-          const shared = await sharesBatchGroup(me.emailNorm, teacher.emailNorm, m);
+        const specStart = specs.length;
+        const otherIds = await directCounterparts();
+        const users = otherIds.length ? await User.find({ _id: { $in: otherIds } }).lean() : [];
+        // Teacher group memberships for ALL candidates in ONE query (the old
+        // sharesBatchGroup ran 2 Membership queries per teacher).
+        const tEmails = [...new Set(users.map((u) => String(u.emailNorm)))];
+        const tRels = tEmails.length
+          ? await Membership.find({ kind: 'teacher', emailNorm: { $in: tEmails }, access: true }).lean()
+          : [];
+        const teacherGroups = new Map();
+        for (const r of tRels) {
+          const e = String(r.emailNorm).trim().toLowerCase();
+          if (!teacherGroups.has(e)) teacherGroups.set(e, []);
+          teacherGroups.get(e).push(r.groupId);
+        }
+        for (const t of users) {
+          if (t.role !== 'teacher' || t.status !== 'Active') continue;
+          if (isSupportAccount(t)) continue; // support chat already listed above
+          // shared authorized BATCH group (batched equivalent of sharesBatchGroup)
+          const tg = teacherGroups.get(String(t.emailNorm).trim().toLowerCase()) || [];
+          const shared = tg.find((gid) => {
+            const grp = m.get(gid);
+            return grp && grp.status === 'Active' && grp.type === 'BATCH' && myGroupIds.has(gid);
+          });
           if (!shared) continue; // relationship no longer authorized -> hide
-          const key = `direct:${[String(me._id), String(teacher._id)].sort().join(':')}`;
-          const vis = await DirectVisibility.findOne({ directKey: key }).lean();
-          out.push({
-            id: key, kind: 'direct', title: teacher.name, subtitle: teacher.subject || '',
-            peerId: String(teacher._id), peerUsername: teacher.username,
-            avatarUrl: teacher.avatarUrl, lastMessage: d.content || '',
-            lastMessageAt: d.createdAt, lastMessageSenderId: String(d.sender || ''),
-            unread: await unreadFor(me, key),
-            hiddenFromTeacher: vis?.hiddenFromTeacher === true,
+          const key = `direct:${[String(me._id), String(t._id)].sort().join(':')}`;
+          add(key, {
+            id: key, kind: 'direct', title: t.name, subtitle: t.subject || '',
+            peerId: String(t._id), peerUsername: t.username,
+            avatarUrl: t.avatarUrl,
+            hiddenFromTeacher: false,
             readOnly: !me.teacherChatAccess,
           });
+        }
+        const directKeys = specs.slice(specStart).map((s) => s.key);
+        const vis = await directVis(directKeys);
+        for (const sp of specs.slice(specStart)) {
+          sp.row.hiddenFromTeacher = vis.get(sp.key)?.hiddenFromTeacher === true;
         }
       }
     } else {
@@ -154,63 +225,69 @@ router.get('/', async (req, res) => {
       // student who wrote to support shows up as a plain direct conversation
       // (sourced from message history — support shares no batch groups).
       if (me.role === 'supportAdmin' || isSupportAccount(me)) {
-        const directs = await Message.find({ directKey: { $exists: true }, participantIds: me._id }).lean();
-        const seen = new Set();
-        for (const d of directs) {
-          const studentId = (d.participantIds || []).map(String).find((x) => x !== String(me._id));
-          if (!studentId || seen.has(studentId)) continue;
-          seen.add(studentId);
-          const student = await User.findById(studentId).lean();
-          if (!student || student.role !== 'student' || student.status !== 'Active') continue;
-          const key = `direct:${[String(me._id), String(student._id)].sort().join(':')}`;
-          const vis = await DirectVisibility.findOne({ directKey: key }).lean();
-          if (vis?.hiddenFromTeacher) continue; // student hid the chat
-          out.push({
-            id: key, kind: 'direct', title: student.name, subtitle: student.course || '',
-            peerId: String(student._id), peerUsername: student.username || '',
-            avatarUrl: student.avatarUrl, status: 'Active',
-            lastMessage: d.content || '', lastMessageAt: d.createdAt,
-            lastMessageSenderId: String(d.sender || ''),
-            unread: await unreadFor(me, key),
+        const otherIds = await directCounterparts();
+        const users = otherIds.length ? await User.find({ _id: { $in: otherIds } }).lean() : [];
+        const candidates = [];
+        for (const st of users) {
+          if (st.role !== 'student' || st.status !== 'Active') continue;
+          candidates.push({ st, key: `direct:${[String(me._id), String(st._id)].sort().join(':')}` });
+        }
+        const vis = await directVis(candidates.map((c) => c.key));
+        for (const c of candidates) {
+          if (vis.get(c.key)?.hiddenFromTeacher) continue; // student hid the chat
+          add(c.key, {
+            id: c.key, kind: 'direct', title: c.st.name, subtitle: c.st.course || '',
+            peerId: String(c.st._id), peerUsername: c.st.username || '',
+            avatarUrl: c.st.avatarUrl, status: 'Active',
           });
         }
       }
       for (const gid of myGroups) {
         const g = m.get(gid);
         if (!g || g.status !== 'Active' || g.type !== 'BATCH') continue;
-        const last = await Message.findOne({ conversationKey: `group:${g.groupId}` }).sort({ createdAt: -1 }).lean();
-        out.push({
+        add(`group:${g.groupId}`, {
           id: g.groupId, kind: 'batch', title: g.name,
           subtitle: g.batchCode ? `Group ${g.batchCode}` : 'Group chat',
           groupId: g.groupId, status: g.status, batchCode: g.batchCode,
           memberCount: memberCounts.get(g.groupId) || 0, avatarUrl: g.avatarUrl || '',
           authorizedTeacherIds: authByGroup.get(g.groupId) || [],
-          lastMessage: last?.content || '', lastMessageAt: last?.createdAt || null,
-          lastMessageSenderId: String(last?.sender || ''),
-          unread: await unreadFor(me, `group:${g.groupId}`),
         });
       }
       // Direct student chats: students in teacher's batch groups
       const studentEmails = await Membership.find({ kind: 'student', groupId: { $in: [...myGroups] }, access: true }).lean();
       const emails = [...new Set(studentEmails.map((s) => s.emailNorm))];
       const students = await User.find({ emailNorm: { $in: emails }, role: 'student', status: 'Active' }).lean();
-      for (const s of students) {
-        const key = `direct:${[String(me._id), String(s._id)].sort().join(':')}`;
-        const last = await Message.findOne({ conversationKey: key }).sort({ createdAt: -1 }).lean();
-        if (!last) continue; // only show started conversations (no global student directory)
-        // A student can hide their chat from the teacher; then it disappears here.
-        const vis = await DirectVisibility.findOne({ directKey: key }).lean();
-        if (vis?.hiddenFromTeacher) continue;
-        out.push({
-          id: key, kind: 'direct', title: s.name, subtitle: s.course || '',
-          peerId: String(s._id), peerUsername: s.username || '',
-          avatarUrl: s.avatarUrl, lastMessage: last.content || '',
-          lastMessageAt: last.createdAt,
-          lastMessageSenderId: String(last.sender || ''),
-          unread: await unreadFor(me, key),
+      const candidates = students.map((s) => ({
+        s,
+        key: `direct:${[String(me._id), String(s._id)].sort().join(':')}`,
+      }));
+      const [vis, stats] = await Promise.all([
+        directVis(candidates.map((c) => c.key)),
+        statsFor(candidates.map((c) => c.key)),
+      ]);
+      for (const c of candidates) {
+        if (!stats.get(c.key).last) continue; // only show started conversations (no global student directory)
+        if (vis.get(c.key)?.hiddenFromTeacher) continue; // student hid the chat
+        add(c.key, {
+          id: c.key, kind: 'direct', title: c.s.name, subtitle: c.s.course || '',
+          peerId: String(c.s._id), peerUsername: c.s.username || '',
+          avatarUrl: c.s.avatarUrl,
         });
       }
     }
+    // Single cached pass: latest message + unread for every collected spec.
+    await statsFor(specs.map((s) => s.key));
+    const out = specs.map((s) => {
+      const st = statsCache.get(s.key);
+      const last = st && st.last;
+      return {
+        ...s.row,
+        lastMessage: (last && last.content) || s.fallbackText || '',
+        lastMessageAt: (last && last.createdAt) || null,
+        lastMessageSenderId: String((last && last.sender) || ''),
+        unread: st ? st.unread : 0,
+      };
+    });
     return res.json({ conversations: out });
   } catch (e) {
     console.error(e);

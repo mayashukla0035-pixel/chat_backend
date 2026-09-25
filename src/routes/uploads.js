@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { authRequired } = require('../middleware/auth');
 const User = require('../models/User');
 const Group = require('../models/Group');
+const { invalidateGroups } = require('../services/groupCache');
 const Membership = require('../models/Membership');
 const Upload = require('../models/Upload');
 const { configured: cloudinaryConfigured, uploadBuffer: cloudinaryUploadBuffer, resourceTypeFor } = require('../services/cloudinary');
@@ -202,6 +203,7 @@ router.post('/group-avatar', upload.single('file'), async (req, res) => {
     if (!authorized) return res.status(403).json({ error: 'You are not authorized to set this group image.' });
     const stored = await storeFile(req, 'groups', groupId);
     await Group.updateOne({ groupId }, { avatarUrl: stored.url });
+    invalidateGroups(); // next group read must see the new avatar
     return res.json({ avatarUrl: stored.url });
   } catch (e) {
     console.error('[uploads] group-avatar failed:', e.message);
