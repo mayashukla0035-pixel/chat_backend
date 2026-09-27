@@ -30,6 +30,15 @@ function cleanMsg(doc, meId) {
   // Same for the reply quote: Mongoose auto-creates the empty subdoc, so a
   // plain message must never ship an empty `replyTo: {}` to clients.
   if (o.replyTo && !o.replyTo.messageId) delete o.replyTo;
+  // Tombstone: for a deleted message only sender + time survive — strip any
+  // payload a stale row might still carry so NO deleted content can render.
+  if (o.deleted) {
+    o.content = '';
+    delete o.attachment;
+    delete o.poll;
+    delete o.replyTo;
+    o.reactions = [];
+  }
   const sender = String(o.sender?._id || o.sender || '');
   o.delivered = (o.deliveredTo || []).some((id) => String(id) !== sender);
   o.read = (o.reads || []).some((id) => String(id) !== sender);
@@ -512,9 +521,18 @@ router.post('/bulk-delete', async (req, res) => {
     }
     const okIds = ok.map((m) => String(m._id));
     if (okIds.length) {
-      await Message.deleteMany({ _id: { $in: okIds } });
+      // SOFT delete (tombstone): the rows stay with their payload stripped so
+      // every participant renders "This message was deleted" in place — a
+      // message must never VANISH from the chat.
+      await Message.updateMany(
+        { _id: { $in: okIds } },
+        {
+          $set: { deleted: true, deletedAt: new Date(), content: '', attachment: null, poll: null, reactions: [] },
+          $unset: { replyTo: '' },
+        }
+      );
       for (const m of ok) {
-        req.app.get('io')?.to(m.conversationKey).emit('message:deleted', { _id: String(m._id), conversation: m.conversationKey });
+        req.app.get('io')?.to(m.conversationKey).emit('message:deleted', { _id: String(m._id), conversation: m.conversationKey, deleted: true });
       }
     }
     return res.json({ ok: okIds.length, deleted: okIds, refused });
@@ -533,8 +551,18 @@ router.delete('/:id', async (req, res) => {
     }
     const isOwner = String(msg.sender) === String(req.user._id);
     if (!isOwner && req.user.role !== 'supportAdmin') return res.status(403).json({ error: 'Not permitted' });
-    await msg.deleteOne();
-    req.app.get('io')?.to(msg.conversationKey).emit('message:deleted', { _id: msg._id, conversation: msg.conversationKey });
+    // SOFT delete (tombstone): the row stays with its payload stripped so
+    // every participant renders "This message was deleted" in place — a
+    // message must never vanish from the chat.
+    msg.deleted = true;
+    msg.deletedAt = new Date();
+    msg.content = '';
+    msg.attachment = null;
+    msg.poll = null;
+    msg.reactions = [];
+    msg.replyTo = null;
+    await msg.save();
+    req.app.get('io')?.to(msg.conversationKey).emit('message:deleted', { _id: msg._id, conversation: msg.conversationKey, deleted: true });
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ error: 'Delete failed' });

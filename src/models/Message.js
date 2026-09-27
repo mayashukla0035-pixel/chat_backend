@@ -64,6 +64,13 @@ const messageSchema = new mongoose.Schema({
   //  - support -> student replies:  supportFor = that student
   // This is what turns the old shared room into per-student private threads.
   supportFor: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
+  // WhatsApp-style deletion: the ROW is kept as a tombstone (content,
+  // attachment, poll, reactions and replyTo are all stripped at delete time)
+  // so every client can render "This message was deleted" IN PLACE — a
+  // message must never vanish from the chat. The flag rides every payload
+  // (history + socket) so fresh and cached clients agree.
+  deleted: { type: Boolean, default: false },
+  deletedAt: { type: Date },
 }, { timestamps: true });
 
 messageSchema.index({ conversationKey: 1, createdAt: 1 });
