@@ -46,7 +46,7 @@ router.get('/search', async (req, res) => {
     const me = req.user;
     const q = String(req.query.q || '').trim().toLowerCase();
     if (!q) return res.json({ teachers: [], students: [] });
-    const { m } = await cachedGroups();
+    const { map: m } = await cachedGroups();
     const rx = new RegExp(escapeRx(q), 'i');
     const out = { teachers: [], students: [] };
 
@@ -129,10 +129,10 @@ router.get('/:id', async (req, res) => {
     if (me.role === 'supportAdmin') ok = true;
     else if (isSupportAccount(me)) ok = true;
     else if (me.role === 'teacher' && target.role === 'student') {
-      const { m } = await cachedGroups();
+      const { map: m } = await cachedGroups();
       ok = !!(await sharesBatchGroup(target.emailNorm, me.emailNorm, m));
     } else if (me.role === 'student' && target.role === 'teacher') {
-      const { m } = await cachedGroups();
+      const { map: m } = await cachedGroups();
       ok = !!(await sharesBatchGroup(me.emailNorm, target.emailNorm, m));
       if (ok) {
         // Privacy: a student may only ever see a teacher's NAME, SUBJECT and

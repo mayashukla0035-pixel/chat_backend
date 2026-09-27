@@ -18,7 +18,7 @@ router.get('/search', async (req, res) => {
     if (!q) return res.json({ teachers: [] });
     const teacher = await User.findOne({ usernameNorm: q, role: 'teacher', status: 'Active' }).lean();
     if (!teacher) return res.json({ teachers: [] });
-    const { m } = await cachedGroups();
+    const { map: m } = await cachedGroups();
     const shared = await sharesBatchGroup(me.emailNorm, teacher.emailNorm, m);
     if (!shared) return res.json({ teachers: [] }); // hide teachers with no shared authorized group
     return res.json({ teachers: [{ id: teacher._id, name: teacher.name, username: teacher.username, subject: teacher.subject, avatarUrl: teacher.avatarUrl, isVerified: teacher.isVerified }] });

@@ -116,7 +116,7 @@ async function canReadConversation(me, conversationKey) {
     // batch), so exempt it.
     if ((isSupportAccount(me) || me.role === 'supportAdmin') && other.role === 'student') return { ok: true };
     if (me.role === 'student' && (isSupportAccount(other) || other.role === 'supportAdmin')) return { ok: true };
-    const { m } = await cachedGroups();
+    const { map: m } = await cachedGroups();
     let shared = null;
     if (me.role === 'student' && other.role === 'teacher') {
       // Reads stay allowed when Teacher Chat Access is FALSE so history is
