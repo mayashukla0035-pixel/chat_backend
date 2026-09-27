@@ -155,14 +155,26 @@ async function pushNewMessage(io, key, msg, sender) {
         android: {
           priority: 'high',
           notification: {
-            // chat_push2: channel whose sound is BUNDLED with the app — the
-            // old chat_push used the device's default notification tone, which
-            // can be a broken/missing file and then the push posts SILENT.
-            channelId: 'chat_push2',
+            // chat_push3: channel whose sound (chat_push3_sound.ogg) is
+            // BUNDLED in the app's res/raw and kept from the release build's
+            // resource shrinker — chat_push2 pointed at a wav that the
+            // shrinker STRIPPED out of the APK (the name only appeared in
+            // Dart code), so closed-app pushes posted SILENT. Fresh id
+            // because an existing channel's sound can never be repaired in
+            // place; OGG because some OEM builds fail on PCM WAV. The
+            // explicit sound name additionally covers pre-8.0 devices,
+            // where the payload — not a channel — picks the sound.
+            channelId: 'chat_push3',
             title,
             body,
-            sound: 'default',
-            clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+            sound: 'chat_push3_sound',
+            // NO clickAction: a custom clickAction makes the system resolve
+            // the tap to an activity declaring that action — installs built
+            // without the FLUTTER_NOTIFICATION_CLICK manifest filter opened
+            // NOTHING when the notification was tapped. The default launcher
+            // intent opens the app on EVERY install, and the message data
+            // (conversationKey) still reaches getInitialMessage() →
+            // onMessageOpenedApp → openFromPush.
           },
         },
       });
