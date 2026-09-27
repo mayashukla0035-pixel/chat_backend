@@ -65,6 +65,13 @@ firebase-debug.log
 *.key
 *.crt
 
+# Google Cloud / FCM service-account keys — PUBLIC repo, never commit.
+# Local dev reads it via GOOGLE_APPLICATION_CREDENTIALS; production uses the
+# FCM_SERVICE_ACCOUNT env var instead. (GitHub push protection blocks it.)
+service-account-fcm.json
+service-account*.json
+*service-account*.json
+
 # Misc
 .vercel/
 .netlify/
