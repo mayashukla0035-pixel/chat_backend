@@ -130,10 +130,13 @@ router.get('/:id', async (req, res) => {
     else if (isSupportAccount(me)) ok = true;
     else if (me.role === 'teacher' && target.role === 'student') {
       const { map: m } = await cachedGroups();
-      ok = !!(await sharesBatchGroup(target.emailNorm, me.emailNorm, m));
+      // PROFILE_FIELDS selects `email` (not the derived emailNorm) — fall back
+      // to it, otherwise the shared-group check ran on '' and every teacher
+      // profile view 403'd for students.
+      ok = !!(await sharesBatchGroup(target.emailNorm || target.email, me.emailNorm, m));
     } else if (me.role === 'student' && target.role === 'teacher') {
       const { map: m } = await cachedGroups();
-      ok = !!(await sharesBatchGroup(me.emailNorm, target.emailNorm, m));
+      ok = !!(await sharesBatchGroup(me.emailNorm, target.emailNorm || target.email, m));
       if (ok) {
         // Privacy: a student may only ever see a teacher's NAME, SUBJECT and
         // USERNAME (plus avatar + verified badge used across the UI) — no
