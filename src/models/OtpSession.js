@@ -3,6 +3,14 @@ const mongoose = require('mongoose');
 const otpSchema = new mongoose.Schema({
   emailNorm: { type: String, required: true, index: true },
   code: { type: String, required: true },
+  // What this code may be used for. 'login' is the legacy emailed sign-in OTP;
+  // 'signup' proves a new account's address and, on success, activates the
+  // account; 'reset' authorises a password change; 'setup' is the emailed code
+  // a spreadsheet-listed user gets on their FIRST login, when the row exists in
+  // the sheet but not yet in the database, and choosing a password also creates
+  // the database row. Scoping the purpose stops a
+  // 'signup' or 'reset' code from being replayed as a sign-in.
+  purpose: { type: String, enum: ['login', 'signup', 'reset', 'setup'], default: 'login', index: true },
   expiresAt: { type: Date, required: true },
   attempts: { type: Number, default: 0 },
 }, { timestamps: true });

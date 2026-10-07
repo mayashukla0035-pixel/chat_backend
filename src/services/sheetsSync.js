@@ -2,6 +2,7 @@
 const { google } = require('googleapis');
 const User = require('../models/User');
 const Group = require('../models/Group');
+const { hashPassword } = require('./password');
 const Membership = require('../models/Membership');
 const SyncLog = require('../models/SyncLog');
 const { norm, toBool } = require('./access');
@@ -119,6 +120,10 @@ async function runSync() {
           teacherChatAccess: toBool(s['Teacher Chat Access'] ?? s['Teacher ChatAccess'] ?? 'TRUE'),
           supportAccess: true,
           status: normStatus(s['Status']),
+          // A row in the sheet is authoritative: if this address previously
+          // self-signed-up, the sheet now adopts it, so its status and group
+          // access are governed from here on.
+          origin: 'sheet',
         },
         { upsert: true, new: true }
       ));
@@ -132,6 +137,29 @@ async function runSync() {
       if (!email) { log.warnings.push('Teacher row missing email'); continue; }
       if (!isEmail(email)) { log.warnings.push(`Teacher row skipped (bad email): ${email}`); continue; }
       const username = String(t['Username'] || '').trim();
+
+      // PASSWORD SOURCE, by decision: a dedicated `Password` column if one is
+      // ever added, otherwise the `Teacher ID` cell itself. The spreadsheet
+      // holds the teacher ID column repurposed as the password — it is hashed
+      // HERE, on the way in, and only the hash is stored or logged. The
+      // plaintext is read, hashed and dropped.
+      //
+      // `teacherId` is still written to its own field, so the identifier keeps
+      // working (teacher credential checks, the teachers search endpoint, the
+      // support login) while the same value doubles as the password.
+      //
+      // Empty => the teacher's password is LEFT ALONE rather than cleared, so
+      // adding this on a live sheet does not wipe passwords that a self-signup
+      // or a Forgot-password reset already set. To REVOKE a teacher set Status
+      // to Inactive: that is the path applySheetDecision honours.
+      const teacherIdCell = String(t['Teacher ID'] || '').trim();
+      const sheetPassword = String(
+        t['Password'] || t['Password Hash'] || t['PasswordHash'] || teacherIdCell || ''
+      ).trim();
+      const passwordUpdate = sheetPassword
+        ? { passwordHash: await hashPassword(sheetPassword), passwordUpdatedAt: new Date() }
+        : {};
+
       const okRow = await safeRow(log, `Teacher ${email}`, () => User.findOneAndUpdate(
         { emailNorm: email, role: 'teacher' },
         {
@@ -145,6 +173,9 @@ async function runSync() {
           role: 'teacher',
           status: normStatus(t['Status']),
           orgAnnouncementAccess: toBool(t['Organization Announcement Access'] ?? 'FALSE'),
+          // See the student upsert: a sheet row adopts any existing account.
+          origin: 'sheet',
+          ...passwordUpdate,
         },
         { upsert: true, new: true }
       ));

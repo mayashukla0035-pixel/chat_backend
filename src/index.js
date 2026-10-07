@@ -49,6 +49,10 @@ app.use('/uploads', express.static(path.resolve(uploadDir), { maxAge: '7d', immu
 app.get('/health', (req, res) =>
   res.json({ ok: true, service: 'skillparkho-backend', push: require('./services/push').pushStatus() }));
 app.use('/api/auth', require('./routes/auth'));
+// Password / signup / Google sign-in. Registered AFTER routes/auth.js on
+// purpose: Express matches in order, and this module owns /login, which must
+// not be shadowed by anything legacy.
+app.use('/api/auth', require('./routes/authAccount'));
 app.use('/api/conversations', require('./routes/conversations'));
 app.use('/api/teachers', require('./routes/teachers'));
 app.use('/api/users', require('./routes/users'));
