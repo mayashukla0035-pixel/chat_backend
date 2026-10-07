@@ -38,6 +38,12 @@ const userSchema = new mongoose.Schema({
   // verification) asks for it explicitly with .select('+passwordHash').
   passwordHash: { type: String, default: '', select: false },
   passwordUpdatedAt: { type: Date, select: false },
+  // True once the holder has chosen their own password (signup, first-login
+  // setup, or a forgot-password reset). The sheet keeps the initial password for
+  // teachers, but it must NOT overwrite a password the teacher has since
+  // changed — otherwise the next periodic sync would silently revert them to the
+  // Teacher ID value and the reset would appear not to have worked.
+  passwordSetByUser: { type: Boolean, default: false },
 
   // ---------- self-signup profile ----------
   // The fields the app's "Create account" form collects, mirroring the React
@@ -66,6 +72,12 @@ const userSchema = new mongoose.Schema({
 
 userSchema.index({ emailNorm: 1, role: 1 }, { unique: true });
 userSchema.index({ usernameNorm: 1 }, { unique: true, sparse: true });
+// One account per mobile number. Partial, because `phone` defaults to '' and a
+// plain unique index would collide on every row that has no number at all.
+userSchema.index(
+  { phone: 1 },
+  { unique: true, partialFilterExpression: { phone: { $type: 'string', $gt: '' } } },
+);
 
 // Belt-and-braces with `select: false`: that setting hides the hash from query
 // results, but a document that was fetched with an explicit

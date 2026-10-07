@@ -11,6 +11,10 @@ const otpSchema = new mongoose.Schema({
   // the database row. Scoping the purpose stops a
   // 'signup' or 'reset' code from being replayed as a sign-in.
   purpose: { type: String, enum: ['login', 'signup', 'reset', 'setup'], default: 'login', index: true },
+  // Which population asked for the code. A reset may have to CREATE the account
+  // (the address was in the spreadsheet but not yet in the database), and that
+  // row needs the right role, so the role travels with the code.
+  role: { type: String, enum: ['student', 'teacher'], default: 'student' },
   expiresAt: { type: Date, required: true },
   attempts: { type: Number, default: 0 },
 }, { timestamps: true });

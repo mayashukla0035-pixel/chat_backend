@@ -38,6 +38,7 @@ const OtpSession = require('../models/OtpSession');
 const { signToken } = require('../middleware/auth');
 const { sendOtpEmail } = require('../services/mailer');
 const { checkUserInSheet, maybeRunSync } = require('../services/sheetsSync');
+const { ensureSupportAccount, isSupportAccount } = require('../services/support');
 const { hashPassword, verifyPassword } = require('../services/password');
 
 const router = express.Router();
@@ -137,6 +138,10 @@ function evictLiveSockets(req, userId) {
  */
 async function applySheetDecision(user) {
   if (user.origin === 'selfSignup') return { ok: true, reason: 'selfSignup' };
+  // The support account is configured from .env, not from a spreadsheet row,
+  // so there is no row for it to be found in. Validating it against the sheet
+  // would lock the support team out of its own room.
+  if (isSupportAccount(user)) return { ok: true, reason: 'support' };
   let verdict = null;
   try {
     verdict = await checkUserInSheet(user.emailNorm);
@@ -185,13 +190,14 @@ async function completeLogin(req, user, deviceId) {
 }
 
 /** Creates (or replaces) the single-use OTP for [email] and emails it. */
-async function issueOtp(req, res, email, userName, purpose) {
+async function issueOtp(req, res, email, userName, purpose, role) {
   const code = makeCode();
   await OtpSession.deleteMany({ emailNorm: email });
   await OtpSession.create({
     emailNorm: email,
     code,
     purpose,
+    ...(role ? { role } : {}),
     expiresAt: new Date(Date.now() + otpTtlMinutes() * 60000),
   });
   const emailed = await sendOtpEmail(email, code, userName).catch(() => false);
@@ -210,8 +216,9 @@ async function consumeOtp(email, code, purpose) {
   if (!sess) return { error: 'Please request the code again.', status: 400 };
   if (new Date() > sess.expiresAt) return { error: 'This code has expired. Please resend it.', status: 400 };
   if (sess.code !== code) return { error: 'Incorrect code. Please check and try again.', status: 400 };
+  const role = sess.role;
   await OtpSession.deleteMany({ emailNorm: email, purpose });
-  return { ok: true };
+  return { ok: true, role };
 }
 
 /**
@@ -286,6 +293,10 @@ router.post('/login', async (req, res) => {
     // +passwordHash: the field is `select: false` on the schema so it cannot
     // leak out of any other query result — this is the only call site that
     // needs it, to verify the submitted password.
+    // Keeps the support account's env-derived password hash current. A
+    // no-op unless that email belongs to support.
+    await ensureSupportAccount().catch(() => null);
+
     const user = await User.findOne({ emailNorm: email }).select('+passwordHash');
     // Same wording whether the address is unknown or the password is wrong, so
     // this cannot be used to enumerate which addresses have accounts.
@@ -532,6 +543,16 @@ router.post('/signup', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
     }
 
+    // One account per mobile number. Checked here as well as by the unique
+    // index, so the user gets a clear sentence instead of a raw duplicate-key
+    // error from the driver.
+    const phoneTaken = await User.findOne({ phone });
+    if (phoneTaken) {
+      return res.status(409).json({
+        error: 'That mobile number is already registered to another account.',
+      });
+    }
+
     const existing = await User.findOne({ emailNorm: email });
     if (existing) {
       // An unverified signup that was never completed may be replaced; a real
@@ -638,16 +659,29 @@ router.post('/forgot-password', async (req, res) => {
       return res.status(400).json({ error: 'Please enter a valid email address.' });
     }
     const generic = { ok: true, expiresMin: otpTtlMinutes(), resendAfter: resendAfterSeconds() };
+    const role = norm(req.body.role) === 'teacher' ? 'teacher' : 'student';
 
+    // Someone qualifies if EITHER the database already holds them, OR the
+    // spreadsheet lists them as Active. The second case matters: the periodic
+    // sync can lag, or be interrupted, leaving a genuinely registered user with
+    // no row — refusing to reset would lock them out of an account the
+    // spreadsheet says they are entitled to.
     const user = await User.findOne({ emailNorm: email });
-    if (!user) return res.json(generic);
+    if (user) {
+      // An account the spreadsheet has deactivated must not be able to reset
+      // its way back in.
+      const decision = await applySheetDecision(user);
+      if (!decision.ok) return res.json(generic);
+      const body = await issueOtp(req, res, email, user.name, 'reset', user.role);
+      return res.json(body);
+    }
 
-    const decision = await applySheetDecision(user);
-    // A removed/inactive account cannot ask for a reset — that would be a way
-    // to keep a revoked account alive.
-    if (!decision.ok) return res.json(generic);
-
-    const body = await issueOtp(req, res, email, user.name, 'reset');
+    const verdict = await checkUserInSheet(email).catch(() => null);
+    if (!verdict || !verdict.inSheet || verdict.status !== 'Active') {
+      return res.json(generic);
+    }
+    // No database row yet — /reset-password will create it from the spreadsheet.
+    const body = await issueOtp(req, res, email, email, 'reset', role);
     return res.json(body);
   } catch (e) {
     console.error('[auth/forgot-password]', e);
@@ -668,17 +702,45 @@ router.post('/reset-password', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
     }
 
-    const user = await User.findOne({ emailNorm: email });
-    if (!user) return res.status(404).json({ error: 'Account not found.' });
-
     const checked = await consumeOtp(email, code, 'reset');
     if (checked.error) return res.status(checked.status).json({ error: checked.error });
 
-    user.passwordHash = await hashPassword(newPassword);
-    user.passwordUpdatedAt = new Date();
-    await user.save();
+    let user = await User.findOne({ emailNorm: email });
+    if (user) {
+      user.passwordHash = await hashPassword(newPassword);
+      user.passwordUpdatedAt = new Date();
+      // From here on the spreadsheet must not overwrite this — for a teacher
+      // that column holds the ORIGINAL Teacher ID, and a sync would otherwise
+      // revert the reset on its next run.
+      user.passwordSetByUser = true;
+      await user.save();
+      return res.json({ ok: true });
+    }
 
-    return res.json({ ok: true });
+    // The code was issued because the SPREADSHEET lists this person but the
+    // database has no row yet, so setting a password has to create the account.
+    // The role travelled with the code, because the row needs the right one.
+    const role = checked.role === 'teacher' ? 'teacher' : 'student';
+    const verdict = await checkUserInSheet(email).catch(() => null);
+    if (!verdict || !verdict.inSheet || verdict.status !== 'Active') {
+      return res.status(403).json({ error: 'Your access has been removed. Please contact SkillParkho support.' });
+    }
+    const created = await User.create({
+      email,
+      emailNorm: email,
+      name: email, // the sync below replaces this with the spreadsheet's name
+      role,
+      status: 'Active',
+      supportAccess: true,
+      origin: 'sheet',
+      passwordHash: await hashPassword(newPassword),
+      passwordUpdatedAt: new Date(),
+      passwordSetByUser: true,
+    });
+    // Group memberships cannot be built until the row exists.
+    await maybeRunSync(0).catch(() => null);
+
+    return res.json({ ok: true, created: true, id: String(created._id) });
   } catch (e) {
     console.error('[auth/reset-password]', e);
     return res.status(500).json({ error: 'Could not update your password. Please try again.' });

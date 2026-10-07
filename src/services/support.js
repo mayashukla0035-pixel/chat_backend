@@ -4,6 +4,7 @@
 // with the full receipt/avatar/unread machinery. Login for this account skips
 // OTP entirely (handled in routes/auth.js) — that is its only special-casing.
 const User = require('../models/User');
+const { hashPassword } = require('./password');
 const Group = require('../models/Group');
 const Membership = require('../models/Membership');
 
@@ -51,6 +52,16 @@ async function ensureSupportAccount() {
       status: 'Active',
       orgAnnouncementAccess: true,
       isVerified: true,
+      // The support account signs in with SUPPORT_TEACHER_ID exactly as it
+      // always has — that value was already the second half of its credentials
+      // for /support-login, and it is now also its password hash, so the ordinary
+      // faculty sign-in form works for it too.
+      passwordHash: await hashPassword(teacherId),
+      // Pinned: the sync must never rewrite this. The support account is not a
+      // spreadsheet row, and its password comes from the environment, so a later
+      // change to SUPPORT_TEACHER_ID (re-provisioned on the next boot) is the
+      // only thing that should move it.
+      passwordSetByUser: true,
     },
     { upsert: true, new: true }
   );

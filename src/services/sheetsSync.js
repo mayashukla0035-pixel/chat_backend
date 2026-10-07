@@ -153,9 +153,17 @@ async function runSync() {
       // or a Forgot-password reset already set. To REVOKE a teacher set Status
       // to Inactive: that is the path applySheetDecision honours.
       const teacherIdCell = String(t['Teacher ID'] || '').trim();
-      const sheetPassword = String(
-        t['Password'] || t['Password Hash'] || t['PasswordHash'] || teacherIdCell || ''
-      ).trim();
+      // Only ever write the sheet's password when the holder has not chosen
+      // one. Once they have — via Forgot password, or their first-login setup —
+      // their choice wins from then on, and every later sync leaves it alone.
+      const existingTeacher = await User.findOne({ emailNorm: email, role: 'teacher' })
+        .select('+passwordSetByUser')
+        .lean();
+      const sheetPassword = existingTeacher && existingTeacher.passwordSetByUser
+        ? ''
+        : String(
+            t['Password'] || t['Password Hash'] || t['PasswordHash'] || teacherIdCell || ''
+          ).trim();
       const passwordUpdate = sheetPassword
         ? { passwordHash: await hashPassword(sheetPassword), passwordUpdatedAt: new Date() }
         : {};
