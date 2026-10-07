@@ -298,6 +298,14 @@ router.post('/validate-session', authRequired, async (req, res) => {
     const u = await User.findById(req.user._id);
     if (!u) return res.status(403).json({ error: 'This account no longer exists.', code: 'SESSION_INVALID' });
     if (isSupportAccount(u)) return res.json({ ok: true });
+    // Self-signups exist only in the database and are never expected to appear
+    // in the spreadsheet. Validating them against it would log every one of them
+    // out on the very next app open.
+    if (u.origin === 'selfSignup') {
+      return u.status === 'Active'
+        ? res.json({ ok: true })
+        : res.status(403).json({ error: 'Your account has been deactivated. Contact your administrator.', code: 'SESSION_INVALID' });
+    }
     const live = await checkUserInSheet(u.emailNorm);
     if (live === null) {
       if (u.status !== 'Active') {
@@ -305,8 +313,12 @@ router.post('/validate-session', authRequired, async (req, res) => {
       }
       return res.json({ ok: true });
     }
+    // NOT being listed is no longer a reason to end the session: an account that
+    // is absent from the spreadsheet keeps working and simply reaches nothing
+    // beyond SkillParkho Support, because it has no group memberships. Only an
+    // explicit Inactive status removes the account.
     if (!live.inSheet) {
-      return res.status(403).json({ error: 'Your account is no longer listed in the SkillParkho sheet. Contact your administrator.', code: 'SESSION_INVALID' });
+      return res.json({ ok: true });
     }
     if (live.status !== 'Active') {
       if (u.status !== 'Inactive') {

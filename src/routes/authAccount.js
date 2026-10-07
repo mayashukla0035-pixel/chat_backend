@@ -135,7 +135,7 @@ function evictLiveSockets(req, userId) {
  * asking would fail-open or fail-closed for no reason. Such a user simply has
  * no group memberships, which is what limits them to SkillParkho Support.
  */
-async function applySheetDecision(user, { requireSheet = true } = {}) {
+async function applySheetDecision(user) {
   if (user.origin === 'selfSignup') return { ok: true, reason: 'selfSignup' };
   let verdict = null;
   try {
@@ -151,26 +151,21 @@ async function applySheetDecision(user, { requireSheet = true } = {}) {
       : { ok: false, status: 403, error: 'Your account is not active.' };
   }
   if (!verdict.inSheet) {
-    // Password sign-in REFUSES here: a spreadsheet row that has gone is how
-    // "permission removed" takes effect.
-    if (requireSheet) {
-      return {
-        ok: false,
-        status: 403,
-        error: 'Your access has been removed. Please contact SkillParkho support.',
-      };
-    }
-    // Google sign-in does NOT refuse. Being absent from the spreadsheet only
-    // decides what such an account can REACH, not whether it may sign in — the
-    // address was proven by Google and the database holds the account, so the
-    // user is admitted with no group memberships, which leaves them with
-    // SkillParkho Support alone. If the spreadsheet later grants them groups,
-    // the sync creates those memberships and they take effect on the next sign-in
-    // or app open — nothing needs re-doing by hand.
+    // The database row proves an account exists; the spreadsheet decides what it
+    // may REACH. A row that is not in the spreadsheet simply has no group
+    // memberships, so the account is admitted with SkillParkho Support alone.
+    // If the spreadsheet later grants groups, the sync creates those
+    // memberships and they take effect on the next sign-in or app open.
     return { ok: true, reason: 'notInSheet' };
   }
+  // Being IN the spreadsheet but Inactive is how removal is expressed, and it
+  // is refused outright — that is the one spreadsheet state that blocks entry.
   if (verdict.status !== 'Active') {
-    return { ok: false, status: 403, error: 'Your account is not active.' };
+    return {
+      ok: false,
+      status: 403,
+      error: 'Your account has been deactivated. Please contact SkillParkho support.',
+    };
   }
   return { ok: true, reason: 'inSheet' };
 }
@@ -231,22 +226,34 @@ async function consumeOtp(email, code, purpose) {
  */
 async function verifyGoogleIdToken(idToken, expectedEmail) {
   const clientId = String(process.env.GOOGLE_WEB_CLIENT_ID || '').trim();
-  if (!idToken || !clientId) return null;
+  if (!idToken) return { error: 'noToken' };
+  if (!clientId) return { error: 'clientIdNotConfigured' };
   try {
     const r = await fetch(
       `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`,
       { method: 'GET' },
     );
-    if (!r.ok) return null;
+    if (!r.ok) {
+      // 400 is what Google returns for a token it will not accept (expired,
+      // wrong audience, tampered with). The body names the reason.
+      const detail = await r.text().catch(() => '');
+      return { error: 'tokeninfoRejected', status: r.status, detail: detail.slice(0, 200) };
+    }
     const info = await r.json();
-    if (norm(info.aud) !== norm(clientId)) return null;
-    if (info.email_verified !== 'true' && info.email_verified !== true) return null;
+    if (norm(info.aud) !== norm(clientId)) {
+      return { error: 'audMismatch', aud: info.aud, expected: clientId };
+    }
+    if (info.email_verified !== 'true' && info.email_verified !== true) {
+      return { error: 'emailNotVerified' };
+    }
     const email = norm(info.email);
-    if (!email || !EMAIL_RE.test(email)) return null;
-    if (expectedEmail && norm(expectedEmail) !== email) return null;
-    return email;
-  } catch (_) {
-    return null;
+    if (!email || !EMAIL_RE.test(email)) return { error: 'badEmail', email: info.email };
+    if (expectedEmail && norm(expectedEmail) !== email) {
+      return { error: 'emailMismatch', got: email, expected: norm(expectedEmail) };
+    }
+    return { ok: true, email };
+  } catch (e) {
+    return { error: 'tokeninfoUnreachable', detail: String(e && e.message).slice(0, 200) };
   }
 }
 
@@ -259,6 +266,10 @@ router.post('/login', async (req, res) => {
     const email = norm(req.body.email);
     const password = String(req.body.password || '');
     const deviceId = String(req.body.deviceId || '').trim() || undefined;
+    // Which form the user signed in from. The two screens are for disjoint
+    // populations, so a teacher must not be able to sign in through the student
+    // form (or the reverse) — that used to be possible and is now refused.
+    const role = norm(req.body.role);
 
     if (!email || !EMAIL_RE.test(email)) {
       return res.status(400).json({ error: 'Please enter a valid email address.' });
@@ -298,6 +309,12 @@ router.post('/login', async (req, res) => {
         failures.delete(failureKey(req, email));
         return res.json({ ...body, ok: true, needsSetup: true, email });
       }
+      bumpFailure(req, email);
+      return bad();
+    }
+    if (role && user.role !== role) {
+      // Deliberately the same wording as a wrong password so this cannot be
+      // used to discover which addresses belong to teachers.
       bumpFailure(req, email);
       return bad();
     }
@@ -443,10 +460,20 @@ router.post('/google-login', async (req, res) => {
     const idToken = String(req.body.idToken || '').trim();
     const deviceId = String(req.body.deviceId || '').trim() || undefined;
 
-    const email = await verifyGoogleIdToken(idToken, claimed);
-    if (!email) {
-      return res.status(401).json({ error: 'Google sign-in could not be verified. Please try again.' });
+    const verified = await verifyGoogleIdToken(idToken, claimed);
+    if (!verified.ok) {
+      // Logged in full so the server's log says WHY. The user-facing text stays
+      // generic on purpose, but the previous single catch-all message made this
+      // indistinguishable from a genuinely bad token, and a missing
+      // GOOGLE_WEB_CLIENT_ID — the most likely cause — looked identical.
+      console.error('[auth/google-login] id token rejected:', verified);
+      const message = verified.error === 'clientIdNotConfigured'
+        ? 'Google sign-in is not set up on this server yet. Please sign in with your email.'
+        : 'Google sign-in could not be verified. Please try again.';
+      const status = verified.error === 'clientIdNotConfigured' ? 500 : 401;
+      return res.status(status).json({ error: message });
     }
+    const email = verified.email;
 
     const user = await User.findOne({ emailNorm: email });
     if (!user) {
@@ -457,10 +484,15 @@ router.post('/google-login', async (req, res) => {
         error: 'No SkillParkho account found for this email. Please create an account first.',
       });
     }
+    // Google sign-in is a student convenience only. A teacher reaching this
+    // button has used the wrong screen and must not get a session this way.
+    if (user.role !== 'student') {
+      return res.status(403).json({
+        error: 'Google sign-in is only available for student accounts. Please use the faculty sign-in.',
+      });
+    }
 
-    // requireSheet: false — the database row is the gate here, and the sheet
-    // only decides group access. See applySheetDecision.
-    const decision = await applySheetDecision(user, { requireSheet: false });
+    const decision = await applySheetDecision(user);
     if (!decision.ok) return res.status(decision.status).json({ error: decision.error });
 
     const { token, user: fresh } = await completeLogin(req, user, deviceId);
