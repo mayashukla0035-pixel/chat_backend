@@ -135,7 +135,7 @@ function evictLiveSockets(req, userId) {
  * asking would fail-open or fail-closed for no reason. Such a user simply has
  * no group memberships, which is what limits them to SkillParkho Support.
  */
-async function applySheetDecision(user) {
+async function applySheetDecision(user, { requireSheet = true } = {}) {
   if (user.origin === 'selfSignup') return { ok: true, reason: 'selfSignup' };
   let verdict = null;
   try {
@@ -151,12 +151,23 @@ async function applySheetDecision(user) {
       : { ok: false, status: 403, error: 'Your account is not active.' };
   }
   if (!verdict.inSheet) {
-    // Known to the database but no longer a row of the sheet: access removed.
-    return {
-      ok: false,
-      status: 403,
-      error: 'Your access has been removed. Please contact SkillParkho support.',
-    };
+    // Password sign-in REFUSES here: a spreadsheet row that has gone is how
+    // "permission removed" takes effect.
+    if (requireSheet) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'Your access has been removed. Please contact SkillParkho support.',
+      };
+    }
+    // Google sign-in does NOT refuse. Being absent from the spreadsheet only
+    // decides what such an account can REACH, not whether it may sign in — the
+    // address was proven by Google and the database holds the account, so the
+    // user is admitted with no group memberships, which leaves them with
+    // SkillParkho Support alone. If the spreadsheet later grants them groups,
+    // the sync creates those memberships and they take effect on the next sign-in
+    // or app open — nothing needs re-doing by hand.
+    return { ok: true, reason: 'notInSheet' };
   }
   if (verdict.status !== 'Active') {
     return { ok: false, status: 403, error: 'Your account is not active.' };
@@ -447,7 +458,9 @@ router.post('/google-login', async (req, res) => {
       });
     }
 
-    const decision = await applySheetDecision(user);
+    // requireSheet: false — the database row is the gate here, and the sheet
+    // only decides group access. See applySheetDecision.
+    const decision = await applySheetDecision(user, { requireSheet: false });
     if (!decision.ok) return res.status(decision.status).json({ error: decision.error });
 
     const { token, user: fresh } = await completeLogin(req, user, deviceId);
