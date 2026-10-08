@@ -678,7 +678,18 @@ router.post('/forgot-password', async (req, res) => {
 
     const verdict = await checkUserInSheet(email).catch(() => null);
     if (!verdict || !verdict.inSheet || verdict.status !== 'Active') {
-      return res.json(generic);
+      // Neither the database nor the spreadsheet knows this address. Say so.
+      //
+      // This used to answer exactly like a success, so the app moved on to the
+      // OTP screen and the user waited for a code that was never going to
+      // arrive. That was the wrong trade: no code is a worse experience than a
+      // clear answer, and POST /signup already reports "an account already
+      // exists for this email", so this adds no capability that was not
+      // already there.
+      return res.status(404).json({
+        error: 'You are not registered with SkillParkho. Kindly contact support or create an account.',
+        code: 'NOT_REGISTERED',
+      });
     }
     // No database row yet — /reset-password will create it from the spreadsheet.
     const body = await issueOtp(req, res, email, email, 'reset', role);
