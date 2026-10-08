@@ -15,6 +15,11 @@ const otpSchema = new mongoose.Schema({
   // (the address was in the spreadsheet but not yet in the database), and that
   // row needs the right role, so the role travels with the code.
   role: { type: String, enum: ['student', 'teacher'], default: 'student' },
+  // A 'signup' code carries the submitted details here instead of the account
+  // being written early. The record expires with its TTL index, so an
+  // unverified signup leaves nothing behind at all — no half-made account to
+  // clean up, and the address is free to try again.
+  payload: { type: mongoose.Schema.Types.Mixed, default: null },
   expiresAt: { type: Date, required: true },
   attempts: { type: Number, default: 0 },
 }, { timestamps: true });

@@ -190,7 +190,7 @@ async function completeLogin(req, user, deviceId) {
 }
 
 /** Creates (or replaces) the single-use OTP for [email] and emails it. */
-async function issueOtp(req, res, email, userName, purpose, role) {
+async function issueOtp(req, res, email, userName, purpose, role, payload) {
   const code = makeCode();
   await OtpSession.deleteMany({ emailNorm: email });
   await OtpSession.create({
@@ -198,6 +198,7 @@ async function issueOtp(req, res, email, userName, purpose, role) {
     code,
     purpose,
     ...(role ? { role } : {}),
+    ...(payload ? { payload } : {}),
     expiresAt: new Date(Date.now() + otpTtlMinutes() * 60000),
   });
   const emailed = await sendOtpEmail(email, code, userName).catch(() => false);
@@ -217,8 +218,9 @@ async function consumeOtp(email, code, purpose) {
   if (new Date() > sess.expiresAt) return { error: 'This code has expired. Please resend it.', status: 400 };
   if (sess.code !== code) return { error: 'Incorrect code. Please check and try again.', status: 400 };
   const role = sess.role;
+  const payload = sess.payload;
   await OtpSession.deleteMany({ emailNorm: email, purpose });
-  return { ok: true, role };
+  return { ok: true, role, payload };
 }
 
 /**
@@ -553,38 +555,26 @@ router.post('/signup', async (req, res) => {
       });
     }
 
+    // Nothing is written to the user store here. The submitted details ride along
+    // with the emailed code and the account is created in /verify-signup, so an
+    // unverified signup leaves NO row behind at all — which is why the TTL index
+    // on OtpSession is enough to make it disappear.
     const existing = await User.findOne({ emailNorm: email });
     if (existing) {
-      // An unverified signup that was never completed may be replaced; a real
-      // account (sheet-synced or already verified) may not be taken over.
-      if (existing.isVerified || existing.origin === 'sheet') {
-        return res.status(409).json({ error: 'An account already exists for this email. Please sign in.' });
-      }
-      await User.deleteOne({ _id: existing._id });
+      return res.status(409).json({ error: 'An account already exists for this email. Please sign in.' });
     }
-    await OtpSession.deleteMany({ emailNorm: email });
+    // A still-pending signup for this address is replaced by this one.
+    await OtpSession.deleteMany({ emailNorm: email, purpose: 'signup' });
 
-    await User.create({
-      email,
-      emailNorm: email,
+    const body = await issueOtp(req, res, email, name, 'signup', 'student', {
       name,
       phone,
-      role: 'student',
       jobStatus,
       graduationYear,
       salaryRange,
       passwordHash: await hashPassword(password),
-      passwordUpdatedAt: new Date(),
-      origin: 'selfSignup',
-      // Inactive until the emailed code proves the address; applySheetDecision
-      // exempts selfSignup rows from sheet checks, so this gate is the only
-      // thing standing between a signup and a usable account.
-      status: 'Inactive',
-      isVerified: false,
-      supportAccess: true,
     });
-
-    const body = await issueOtp(req, res, email, name, 'signup');
+    return res.status(201).json(body);
     return res.status(201).json(body);
   } catch (e) {
     console.error('[auth/signup]', e);
@@ -602,18 +592,33 @@ router.post('/verify-signup', async (req, res) => {
     const deviceId = String(req.body.deviceId || '').trim() || undefined;
     if (!email || !code) return res.status(400).json({ error: 'Please enter the 6-digit code.' });
 
-    const user = await User.findOne({ emailNorm: email });
-    if (!user) return res.status(404).json({ error: 'Account not found. Please sign up again.' });
-    if (user.isVerified) {
-      return res.status(409).json({ error: 'This account is already verified. Please sign in.' });
-    }
-
     const checked = await consumeOtp(email, code, 'signup');
     if (checked.error) return res.status(checked.status).json({ error: checked.error });
 
-    user.isVerified = true;
-    user.status = 'Active';
-    await user.save();
+    // The account is created ONLY here, from the details submitted with the
+    // form. Never verifying simply lets the record expire with its TTL, so an
+    // abandoned signup leaves nothing behind at all.
+    const p = checked.payload || {};
+    if (!p.passwordHash || !p.name) {
+      return res.status(400).json({ error: 'This sign-up has expired. Please try again.' });
+    }
+    const user = await User.create({
+      email,
+      emailNorm: email,
+      name: p.name,
+      phone: p.phone || '',
+      role: 'student',
+      jobStatus: p.jobStatus || '',
+      graduationYear: p.graduationYear || '',
+      salaryRange: p.salaryRange || '',
+      passwordHash: p.passwordHash,
+      passwordUpdatedAt: new Date(),
+      passwordSetByUser: true,
+      origin: 'selfSignup',
+      status: 'Active',
+      isVerified: true,
+      supportAccess: true,
+    });
 
     const { token, user: fresh } = await completeLogin(req, user, deviceId);
     // A brand-new signup has no sheet row and therefore no group memberships,
