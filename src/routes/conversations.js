@@ -167,7 +167,9 @@ router.get('/', async (req, res) => {
         if (!g || g.status !== 'Active' || g.type !== 'BATCH') continue;
         add(`group:${g.groupId}`, {
           id: g.groupId, kind: 'batch', title: g.name,
-          subtitle: g.batchCode ? `Group ${g.batchCode}` : 'Group chat',
+          // No group/batch code: the group detail screen renders this
+          // directly under the avatar, and it is an identifier, not a label.
+          subtitle: 'Group chat',
           groupId: g.groupId, status: g.status, batchCode: g.batchCode,
           memberCount: memberCounts.get(g.groupId) || 0, avatarUrl: g.avatarUrl || '',
           authorizedTeacherIds: authByGroup.get(g.groupId) || [],
@@ -247,7 +249,9 @@ router.get('/', async (req, res) => {
         if (!g || g.status !== 'Active' || g.type !== 'BATCH') continue;
         add(`group:${g.groupId}`, {
           id: g.groupId, kind: 'batch', title: g.name,
-          subtitle: g.batchCode ? `Group ${g.batchCode}` : 'Group chat',
+          // No group/batch code: the group detail screen renders this
+          // directly under the avatar, and it is an identifier, not a label.
+          subtitle: 'Group chat',
           groupId: g.groupId, status: g.status, batchCode: g.batchCode,
           memberCount: memberCounts.get(g.groupId) || 0, avatarUrl: g.avatarUrl || '',
           authorizedTeacherIds: authByGroup.get(g.groupId) || [],
