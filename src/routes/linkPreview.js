@@ -11,14 +11,27 @@ const {
 const router = express.Router();
 
 // Previewing is a server-side outbound fetch, so it is the most expensive call
-// in the API. Capped per user per minute, and an in-process queue below stops
-// a burst of them from opening hundreds of sockets at once.
-const limiter = rateLimit({
+// in the API, and it is capped — but the cap is per ACCOUNT, not per IP.
+//
+// The first version keyed on IP, which is wrong for a mobile app: carrier NAT
+// puts hundreds of students behind one address, so a single chatty user could
+// spend the whole 30/minute budget for everyone else. Opening a conversation
+// with a dozen links was enough to start returning 429, and a 429 means "no
+// thumbnail" — which is exactly how this feature looked broken.
+//
+// 60/minute per account is far above what one person generates (results are
+// cached for 7 days, so repeat views cost nothing) while still capping a
+// runaway client.
+const previewLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 30,
+  max: 60,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many link previews. Try again in a minute.' },
+  keyGenerator: (req) => String(req.user && req.user._id ? req.user._id : req.ip),
+  // Being limited is not an error the bubble should show or retry into. Answer
+  // 200 with no preview and the bubble falls back to a plain underlined link,
+  // which is a graceful outcome instead of a blank space.
+  handler: (req, res) => res.json({ ok: true, preview: null, limited: true }),
 });
 
 // GET /api/link-preview?url=<address>
@@ -31,7 +44,8 @@ const limiter = rateLimit({
 //
 // `preview: null` is a SUCCESS, not a 404: most links genuinely have no
 // preview, and the bubble then renders as an ordinary underlined link.
-router.get('/', limiter, authRequired, async (req, res) => {
+// Auth BEFORE the limiter: keying per account needs the resolved user.
+router.get('/', authRequired, previewLimiter, async (req, res) => {
   const raw = String(req.query.url || '');
   if (!raw) return res.status(400).json({ error: 'url is required' });
 
