@@ -137,6 +137,30 @@ function isPrivateV6(ip) {
 }
 
 /**
+ * Cheap, DNS-free public-address check for a URL the CLIENT will fetch.
+ *
+ * Deliberately does not resolve DNS: that check exists to stop this server
+ * being aimed at an internal host, whereas here the target is the reader's
+ * own device and a public hostname that resolves privately is vanishingly
+ * rare next to a literal 192.168.x.1 sitting in an og:image tag.
+ */
+function isPubliclyFetchableImage(url) {
+  let u;
+  try { u = new URL(url); } catch (_) { return false; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (!host) return false;
+  if (host === 'localhost' || host.endsWith('.localhost')) return false;
+  if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.home.arpa')) return false;
+  const literal = net.isIP(host);
+  if (literal === 4) return !isPrivateV4(host);
+  if (literal === 6) return !isPrivateV6(host);
+  // `0`, decimal-encoded IPv4 and friends are all caught by the ranges above
+  // once normalised; anything left that is not a dotted quad is a real name.
+  return true;
+}
+
+/**
  * Throws if [url] could reach something that is not a public web server.
  * Called for the original URL AND every redirect hop.
  */
@@ -299,6 +323,13 @@ function parsePreview(html, finalUrl) {
   if (image) {
     try { image = new URL(image, finalUrl).toString(); } catch (_) { image = ''; }
   }
+  // The preview IMAGE is fetched by the PHONE, not by this server, so the SSRF
+  // guard above does not cover it. A page can put anything in og:image — a
+  // real site was serving `http://localhost:3000/...`, which can never load
+  // and leaves a blank hole in the chat, and a hostile one could aim the
+  // reader's phone at their own router (192.168.x.1) or a device on the
+  // school's LAN. Drop anything that is not a public http(s) address.
+  if (image && !isPubliclyFetchableImage(image)) image = '';
   return {
     title: title.slice(0, 300),
     description: decode(description).slice(0, 500),
@@ -316,8 +347,12 @@ function parsePreview(html, finalUrl) {
 async function fetchPreview(url) {
   if (isYouTube(url)) {
     const id = youtubeVideoId(url);
-    if (!id) return null;
-    try {
+    // No video id means it is not a single video — a playlist, a channel, a
+    // search. Returning null there left those messages as bare underlined
+    // links with no card at all; fall through to the generic Open Graph path
+    // so they at least get a title and a thumbnail.
+    if (id) {
+      try {
       const endpoint = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
       const res = await fetch(endpoint, {
         signal: AbortSignal.timeout(FETCH_MS),
@@ -359,7 +394,12 @@ async function fetchPreview(url) {
         thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
         siteName: 'YouTube',
       };
+      }
     }
+    // No video id: this is a playlist, a channel or a search, not a single
+    // video. Returning null there left the message as a bare underlined link
+    // with no card at all, so fall through to the generic Open Graph path and
+    // give it a title and a thumbnail like any other shared page.
   }
 
   try {
@@ -367,7 +407,16 @@ async function fetchPreview(url) {
   } catch (_) {
     return null;
   }
-  const html = await fetchHtml(url);
+  // Every failure from here on is "this page has no preview we can show" —
+  // a timeout, a 403, a certificate problem, a redirect loop. None of them may
+  // escape as an exception: the endpoint answers 200 with no preview, and the
+  // bubble falls back to a plain link.
+  let html;
+  try {
+    html = await fetchHtml(url);
+  } catch (_) {
+    return null;
+  }
   if (!html) return null;
   const data = parsePreview(html, url);
   if (!data.title && !data.image && !data.description) return null;
@@ -376,6 +425,7 @@ async function fetchPreview(url) {
 
 module.exports = {
   extractFirstUrl,
+  isPubliclyFetchableImage,
   isYouTube,
   youtubeVideoId,
   youtubeEmbedUrl,
