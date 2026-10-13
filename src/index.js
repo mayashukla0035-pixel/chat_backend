@@ -60,6 +60,8 @@ app.use('/api/uploads', require('./routes/uploads'));
 app.use('/api/drive', require('./routes/drive'));
 app.use('/api/messages', require('./routes/messages'));
 app.use('/api/sync', require('./routes/sync'));
+// Link unfurling for chat bubbles (YouTube cards + Open Graph previews).
+app.use('/api/link-preview', require('./routes/linkPreview'));
 
 const server = http.createServer(app);
 // Keep sockets alive across load-balancer idle checks (the default 5s
