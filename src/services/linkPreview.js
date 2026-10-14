@@ -99,7 +99,7 @@ function youtubeVideoId(url) {
 /** The in-app player URL. youtube-nocookie is used deliberately: it embeds
  *  without setting tracking cookies, which is what a school deployment wants. */
 function youtubeEmbedUrl(videoId) {
-  return `https://www.youtube-nocookie.com/embed/${videoId}?playsinline=1&rel=0`;
+  return `https://www.youtube.com/embed/${videoId}?playsinline=1&autoplay=1&rel=0&origin=https://www.youtube.com`;
 }
 
 // ---------------------------------------------------------------------------
