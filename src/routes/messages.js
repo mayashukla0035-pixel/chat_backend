@@ -231,7 +231,9 @@ router.get('/', async (req, res) => {
     const key = String(req.query.conversation || '');
     const check = await canReadConversation(req.user, key);
     if (!check.ok) return res.status(403).json({ error: 'Not authorized for this conversation.' });
-    const limit = Math.min(Number(req.query.limit || 50), 100);
+    // No pagination in the client: a single fetch must be able to carry an
+    // entire conversation. Keep a generous cap for safety instead of 100.
+    const limit = Math.min(Number(req.query.limit || 50), 100000);
     const q = { conversationKey: key };
     if (req.query.before) q.createdAt = { $lt: new Date(req.query.before) };
     const msgs = await Message.find(q).sort({ createdAt: -1 }).limit(limit).lean();
