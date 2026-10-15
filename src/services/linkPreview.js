@@ -221,10 +221,10 @@ async function assertPublicUrl(url) {
 // HTML fetch + parse
 // ---------------------------------------------------------------------------
 
-const UA = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36';
-const FETCH_MS = 6000;
-const MAX_BYTES = 600 * 1024; // a <head> is tiny; a huge page must not be buffered whole
-const MAX_REDIRECTS = 3;
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const FETCH_MS = 20000;
+const MAX_BYTES = 2 * 1024 * 1024; // read more of the page so OG tags lower in the HTML are not missed
+const MAX_REDIRECTS = 10;
 
 /** Reads at most MAX_BYTES so a multi-megabyte page cannot exhaust memory. */
 async function readCapped(res) {
@@ -316,8 +316,28 @@ function parsePreview(html, finalUrl) {
   }
   const title = meta['og:title'] || meta['twitter:title'] || decode((/<title[^>]*>([\s\S]*?)<\/title>/i.exec(head) || [])[1] || '');
   const description = meta['og:description'] || meta['twitter:description'] || meta.description || '';
-  let image = meta['og:image'] || meta['twitter:image'] || meta['og:image:url'] || '';
+  let image =
+    meta['og:image'] ||
+    meta['og:image:url'] ||
+    meta['og:image:secure_url'] ||
+    meta['twitter:image'] ||
+    meta['twitter:image:src'] ||
+    '';
   const siteName = meta['og:site_name'] || '';
+
+  // Fallback: <link rel="image_src"> (used by some sites instead of OG)
+  if (!image) {
+    const linkRe = /<link\b[^>]*>/gi;
+    let lm;
+    while ((lm = linkRe.exec(head))) {
+      const la = attrs(lm[0]);
+      if ((la.rel || '').toLowerCase().includes('image_src') && la.href) {
+        image = la.href;
+        break;
+      }
+    }
+  }
+
   let host = '';
   try { host = new URL(finalUrl).hostname.replace(/^www\./, ''); } catch (_) { /* keep '' */ }
   if (image) {

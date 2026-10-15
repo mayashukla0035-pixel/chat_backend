@@ -59,11 +59,12 @@ router.get('/', authRequired, previewLimiter, async (req, res) => {
 
     const preview = await enqueue(() => fetchPreview(url));
 
-    // Cache failures too. A page that 403s the scraper today will 403 it on
-    // every later scroll-back, and re-fetching it each time is pure waste.
+    // Real previews last 7 days; null/no-preview results only 1 hour so a
+    // temporarily-down site (or Instagram while logged out) gets retried soon.
+    const ttlMs = preview == null ? 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
     await LinkPreview.updateOne(
       { url: key },
-      { $set: { payload: preview, expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) } },
+      { $set: { payload: preview, expires: new Date(Date.now() + ttlMs) } },
       { upsert: true }
     ).catch((e) => console.warn('link-preview cache write failed:', e.message));
 
