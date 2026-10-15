@@ -305,7 +305,7 @@ function attrs(tag) {
 
 /** Pulls Open Graph / Twitter card / plain <title> out of the page head. */
 function parsePreview(html, finalUrl) {
-  const head = html.slice(0, 200 * 1024);
+  const head = html.slice(0, 2 * 1024 * 1024);
   const meta = {};
   const metaRe = /<meta\b[^>]*>/gi;
   let m;
@@ -316,6 +316,7 @@ function parsePreview(html, finalUrl) {
   }
   const title = meta['og:title'] || meta['twitter:title'] || decode((/<title[^>]*>([\s\S]*?)<\/title>/i.exec(head) || [])[1] || '');
   const description = meta['og:description'] || meta['twitter:description'] || meta.description || '';
+  // --- Image: OG/Twitter first, then <link rel=image_src>, then schema.org itemprop, then first  ---
   let image =
     meta['og:image'] ||
     meta['og:image:url'] ||
@@ -323,9 +324,8 @@ function parsePreview(html, finalUrl) {
     meta['twitter:image'] ||
     meta['twitter:image:src'] ||
     '';
-  const siteName = meta['og:site_name'] || '';
 
-  // Fallback: <link rel="image_src"> (used by some sites instead of OG)
+  // <link rel="image_src"> fallback
   if (!image) {
     const linkRe = /<link\b[^>]*>/gi;
     let lm;
@@ -338,24 +338,51 @@ function parsePreview(html, finalUrl) {
     }
   }
 
+  // Schema.org itemprop="image" fallback (common on e-commerce/product pages)
+  if (!image) {
+    const itemRe = /<[^>]*itemprop=["']image["'][^>]*>/gi;
+    let im;
+    while ((im = itemRe.exec(head))) {
+      const la = attrs(im[0]);
+      if (la.content) { image = la.content; break; }
+      if (la.src) { image = la.src; break; }
+    }
+  }
+
+  // Last resort: first  tag in the early HTML that looks like a real image
+  if (!image) {
+    const imgRe = /<img\b[^>]*>/gi;
+    let im;
+    while ((im = imgRe.exec(head))) {
+      const la = attrs(im[0]);
+      const src = la.src || la['data-src'] || la['data-lazy-src'] || '';
+      if (!src) continue;
+      const low = src.toLowerCase();
+      if (low.endsWith('.svg') || low.includes('pixel') || low.includes('spacer') || (low.includes('logo') && low.includes('icon'))) continue;
+      image = src;
+      break;
+    }
+  }
+
+  const siteName = meta['og:site_name'] || '';
+
   let host = '';
   try { host = new URL(finalUrl).hostname.replace(/^www\./, ''); } catch (_) { /* keep '' */ }
   if (image) {
     try { image = new URL(image, finalUrl).toString(); } catch (_) { image = ''; }
   }
-  // The preview IMAGE is fetched by the PHONE, not by this server, so the SSRF
-  // guard above does not cover it. A page can put anything in og:image — a
-  // real site was serving `http://localhost:3000/...`, which can never load
-  // and leaves a blank hole in the chat, and a hostile one could aim the
-  // reader's phone at their own router (192.168.x.1) or a device on the
-  // school's LAN. Drop anything that is not a public http(s) address.
+  // SSRF guard on the image URL — the phone fetches it directly, so it must be public.
   if (image && !isPubliclyFetchableImage(image)) image = '';
+
+  // Title: prefer OG/Twitter, then <title>, then domain as last resort
+  if (!title) title = host;
   return {
     title: title.slice(0, 300),
     description: decode(description).slice(0, 500),
     image: image.slice(0, 2000),
-    siteName: siteName.slice(0, 80) || host,
+    siteName: (siteName.slice(0, 80) || host),
   };
+
 }
 
 // ---------------------------------------------------------------------------
