@@ -118,32 +118,66 @@ function isInstagram(url) {
   }
 }
 
-/** Instagram oEmbed endpoint. Works without any API key or app review for
- *  public posts/reels. Meta removed thumbnail_url from the response in Nov
- *  2025, so we get html (embed code) + title + author, but no standalone
- *  image URL. The html embed is what we hand to the client. */
+/** Instagram preview — combines oEmbed (title/author) with page scraping
+ *  for a thumbnail image, since Meta removed thumbnail_url from oEmbed in
+ *  Nov 2025. We fetch the Instagram page HTML and look for og:image,
+ *  twitter:image, or the profile picture embedded in __NEXT_DATA__. */
 async function fetchInstagramOEmbed(url) {
+  let title = 'Instagram';
+  let author = 'Instagram';
+  let thumbnail = '';
+  let html = '';
+
+  // 1) oEmbed for title + author (no API key needed for public posts)
   try {
     const oembedUrl = `https://api.instagram.com/oembed?url=${encodeURIComponent(url)}`;
     const res = await fetch(oembedUrl, {
       signal: AbortSignal.timeout(10000),
       headers: { 'user-agent': UA },
     });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return {
-      kind: 'instagram',
-      url,
-      title: data.title || 'Instagram',
-      author: data.author_name || 'Instagram',
-      thumbnail: data.thumbnail_url || '', // usually empty now (removed by Meta)
-      html: data.html || '', // embed iframe code
-      provider: data.provider_name || 'Instagram',
-      siteName: 'Instagram',
-    };
-  } catch (_) {
-    return null;
-  }
+    if (res.ok) {
+      const data = await res.json();
+      title = data.title || 'Instagram';
+      author = data.author_name || 'Instagram';
+      html = data.html || '';
+    }
+  } catch (_) {}
+
+  // 2) Fetch the Instagram page HTML and scrape for a thumbnail image
+  try {
+    await assertPublicUrl(url);
+    const pageHtml = await fetchHtml(url);
+    if (pageHtml) {
+      // og:image / twitter:image
+      const ogImage = pageHtml.match(/<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image)["'][^>]+content=["']([^"']+)["']/i);
+      if (ogImage && ogImage[1]) {
+        try { thumbnail = new URL(ogImage[1], url).toString(); } catch (_) { thumbnail = ogImage[1]; }
+      }
+      // Profile picture from __NEXT_DATA__ (Instagram embeds user data)
+      if (!thumbnail) {
+        const pp = pageHtml.match(/"profile_pic_url":"([^"]+)"/i);
+        if (pp && pp[1]) thumbnail = pp[1].replace(/\\u0026/g, '&').replace(/\\\\\//g, '/');
+      }
+      // Fallback: any large image URL in the page
+      if (!thumbnail) {
+        const img = pageHtml.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i);
+        if (img && img[1]) {
+          try { thumbnail = new URL(img[1], url).toString(); } catch (_) { thumbnail = img[1]; }
+        }
+      }
+    }
+  } catch (_) {}
+
+  return {
+    kind: 'instagram',
+    url,
+    title,
+    author,
+    thumbnail,
+    html,
+    provider: 'Instagram',
+    siteName: 'Instagram',
+  };
 }
 
 // ---------------------------------------------------------------------------
