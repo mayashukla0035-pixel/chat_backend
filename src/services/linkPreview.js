@@ -103,6 +103,50 @@ function youtubeEmbedUrl(videoId) {
 }
 
 // ---------------------------------------------------------------------------
+// Instagram (oEmbed — no credentials needed for public posts)
+// ---------------------------------------------------------------------------
+
+const IG_HOSTS = new Set([
+  'instagram.com', 'www.instagram.com',
+]);
+
+function isInstagram(url) {
+  try {
+    return IG_HOSTS.has(new URL(url).hostname.toLowerCase());
+  } catch (_) {
+    return false;
+  }
+}
+
+/** Instagram oEmbed endpoint. Works without any API key or app review for
+ *  public posts/reels. Meta removed thumbnail_url from the response in Nov
+ *  2025, so we get html (embed code) + title + author, but no standalone
+ *  image URL. The html embed is what we hand to the client. */
+async function fetchInstagramOEmbed(url) {
+  try {
+    const oembedUrl = `https://api.instagram.com/oembed?url=${encodeURIComponent(url)}`;
+    const res = await fetch(oembedUrl, {
+      signal: AbortSignal.timeout(10000),
+      headers: { 'user-agent': UA },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return {
+      kind: 'instagram',
+      url,
+      title: data.title || 'Instagram',
+      author: data.author_name || 'Instagram',
+      thumbnail: data.thumbnail_url || '', // usually empty now (removed by Meta)
+      html: data.html || '', // embed iframe code
+      provider: data.provider_name || 'Instagram',
+      siteName: 'Instagram',
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // SSRF guard
 // ---------------------------------------------------------------------------
 
@@ -449,6 +493,16 @@ async function fetchPreview(url) {
     // give it a title and a thumbnail like any other shared page.
   }
 
+  // Instagram: use oEmbed (no credentials needed for public posts/reels).
+  // Meta removed thumbnail_url from oEmbed in Nov 2025, so we get embed html
+  // + title + author instead of a standalone image. The client renders the
+  // embed html inside the chat card.
+  if (isInstagram(url)) {
+    const ig = await fetchInstagramOEmbed(url);
+    if (ig) return ig;
+    // Fall through to generic OG if oEmbed failed (private account, etc.)
+  }
+
   try {
     await assertPublicUrl(url);
   } catch (_) {
@@ -476,6 +530,8 @@ module.exports = {
   isYouTube,
   youtubeVideoId,
   youtubeEmbedUrl,
+  isInstagram,
+  fetchInstagramOEmbed,
   fetchPreview,
   cacheKey,
   assertPublicUrl,
